@@ -34,8 +34,19 @@ log_file = "/tmp/tierkv.log"
 # Evict hot KV cache when RAM usage exceeds this fraction (0.0–1.0)
 memory_threshold = 0.60
 
-# KV head dimension for TurboQuant — must be divisible by 8
-# Qwen3.6-35B-A3B: 256 (full-attention head_dim)
+# KV head dimension for TurboQuant — must match your model's attention head_dim.
+# Using the wrong value causes silently incorrect compression.
+#
+# Common values:
+#   Qwen3.6-35B-A3B (MoE, full-attention layers): 256
+#   Llama-3 8B / 70B (GQA):                       128
+#   Qwen2.5 7B / 14B / 32B:                        128
+#   Mistral 7B:                                    128
+#   Phi-3 medium:                                   96
+#
+# To find the right value for any model:
+#   head_dim = hidden_size / num_attention_heads
+#   (or look for "head_dim" directly in the model's config.json)
 kv_dim = 256
 
 [vault]
