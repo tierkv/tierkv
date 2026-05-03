@@ -1,6 +1,6 @@
 # tierkv
 
-[![Build Wheels](https://github.com/prasanna-in/EXO_PK/actions/workflows/wheels.yml/badge.svg)](https://github.com/prasanna-in/EXO_PK/actions/workflows/wheels.yml)
+[![Build Wheels](https://github.com/tierkv/tierkv/actions/workflows/wheels.yml/badge.svg)](https://github.com/tierkv/tierkv/actions/workflows/wheels.yml)
 
 **3-tier distributed KV cache for LLM inference.**
 
