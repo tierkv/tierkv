@@ -1,5 +1,7 @@
 # tierkv
 
+[![Build Wheels](https://github.com/prasanna-in/EXO_PK/actions/workflows/wheels.yml/badge.svg)](https://github.com/prasanna-in/EXO_PK/actions/workflows/wheels.yml)
+
 **3-tier distributed KV cache for LLM inference.**
 
 When your GPU evicts a KV cache entry, tierkv ships it to another machine over gRPC instead of dropping it. On the next request with the same prompt, the KV is fetched back in a single batch call — skipping the expensive prefill entirely.
@@ -64,6 +66,8 @@ You need at least 2 machines: one running inference, one as cold storage. Three 
 ---
 
 ## Installation
+
+**EXO compatibility:** tierkv patches EXO's `cache.py` and `builder.py` in-place. Tested with EXO as of May 2026. EXO moves fast — if `tierkv install` errors, check that the patch targets in `cache.py` and `builder.py` still match. EXO version auto-detection is on the [roadmap](#roadmap).
 
 Download the prebuilt wheel for your platform from the [latest release](https://github.com/tierkv/tierkv/releases):
 
@@ -148,6 +152,8 @@ port = 50051
 
 ### Step 2 — Start vault servers on cold nodes
 
+> **Warning — unbounded RAM growth:** The vault holds all received KV data in RAM and currently has no eviction policy. On a Mac Air (16 GB) running a long session, vault RAM will grow until the process is killed. Monitor with `tierkv status` and restart vault servers between sessions if needed. LRU eviction is on the [roadmap](#roadmap).
+
 On **Mac Pro** and **Mac Air** (not on DGX):
 
 ```bash
@@ -195,13 +201,30 @@ tierkv status
 tierkv bench --exo-api http://192.168.50.11:52415
 ```
 
+Expected output:
+
+```
+[tierkv bench] EXO API: http://192.168.50.11:52415
+
+  Request 1 — cold start (TARGET): 8.41s   response: 'The key advantage of mixture-of-experts…'
+  Waiting 12s for async eviction to complete...
+  Request 2 — evict step (different prompt): 1.12s   response: 'Sure, here is a short poem…'
+  Waiting 12s for eviction gRPC to settle...
+  Request 3 — restore (TARGET from cold): 1.62s   response: 'The key advantage of mixture-of-experts…'
+
+  Speedup (cold → restore): 5.2×
+  Time saved per request:   6.79s
+```
+
+A speedup below **1.5×** means the cold tier isn't being hit — check `tierkv status` to confirm the vault servers are running and reachable.
+
 ---
 
 ## TurboQuant
 
 tierkv includes a **per-group INT8 quantizer** for KV tensor compression before sending over the network.
 
-- Group size: 256 floats (matches Qwen3.6-35B-A3B head_dim)
+- Group size: `kv_dim` floats — must match your model's attention head dimension (default 256 for Qwen3.6-35B-A3B; use 128 for Llama-3, Qwen2.5, Mistral; see `tierkv.toml.example` for how to find the right value for other models)
 - Each group gets its own absmax scale: `scale = max(|x|) / 127`
 - Wire format: `[scale: f32 LE][i8 × 256]` per group
 - Compression ratio: **~3.9×** (BF16 input → INT8 output)
