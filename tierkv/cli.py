@@ -93,8 +93,18 @@ def cmd_install(args):
             wheel_file = f"tierkv_core-{tierkv_version}-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
         wheel_url = f"https://github.com/tierkv/tierkv/releases/download/v{tierkv_version}/{wheel_file}"
 
-        # tierkv Python package lives alongside this file
-        tierkv_pkg_root = Path(__file__).parent.parent
+        # Find uv — check PATH and common install locations
+        def _find_uv():
+            uv = shutil.which("uv")
+            if uv:
+                return uv
+            for candidate in [
+                Path.home() / ".local" / "bin" / "uv",
+                Path("/usr/local/bin/uv"),
+            ]:
+                if candidate.exists():
+                    return str(candidate)
+            return None
 
         def _run_pip(python, *install_args):
             result = subprocess.run(
@@ -102,7 +112,7 @@ def cmd_install(args):
                 capture_output=True, text=True,
             )
             if result.returncode != 0:
-                uv = shutil.which("uv")
+                uv = _find_uv()
                 if uv:
                     result = subprocess.run(
                         [uv, "pip", "install", "--quiet", "--python", str(python), *install_args],
@@ -118,12 +128,21 @@ def cmd_install(args):
             print(f"                 {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'unknown error'}")
             print(f"                 Run manually: {venv_python} -m pip install {wheel_url}")
 
-        r2 = _run_pip(venv_python, "--no-deps", str(tierkv_pkg_root))
-        if r2.returncode == 0:
+        # Copy tierkv Python package directly into EXO venv site-packages
+        # (tierkv is not on PyPI — direct copy is more reliable than pip install)
+        venv_site = subprocess.run(
+            [str(venv_python), "-c", "import site; print(site.getsitepackages()[0])"],
+            capture_output=True, text=True,
+        )
+        if venv_site.returncode == 0:
+            dst_pkg = Path(venv_site.stdout.strip()) / "tierkv"
+            src_pkg = Path(__file__).parent  # the tierkv package dir (contains cli.py etc.)
+            if dst_pkg.exists():
+                shutil.rmtree(dst_pkg)
+            shutil.copytree(src_pkg, dst_pkg)
             print(f"[tierkv install] Installed tierkv into EXO venv")
         else:
-            print(f"[tierkv install] Warning: could not install tierkv into EXO venv:")
-            print(f"                 Run manually: {venv_python} -m pip install --no-deps {tierkv_pkg_root}")
+            print(f"[tierkv install] Warning: could not determine EXO venv site-packages path")
     else:
         print(f"[tierkv install] Warning: EXO venv not found at {exo_repo_root}/.venv")
         print( "                 Install tierkv manually into EXO's Python environment.")
