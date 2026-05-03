@@ -221,3 +221,4 @@ Over one test session: 227 evictions, 6 successful cold restores, ~26s saved per
 - Mac Air on LAN (WiFi is the current SSM restore bottleneck)
 - Quantization quality validation with `_kv_offsets` fix in place
 - EXO version detection for hook compatibility
+- LRU eviction inside the cold vault (configurable max capacity — currently vaults grow unbounded in RAM)
