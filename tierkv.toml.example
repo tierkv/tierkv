@@ -1,0 +1,46 @@
+# tierkv.toml — cluster configuration
+#
+# Copy this file to tierkv.toml and fill in your node addresses.
+# tierkv.toml is gitignored (contains personal IPs).
+#
+# Search order: TIERKV_CONFIG env var → ./tierkv.toml → ~/.config/tierkv/tierkv.toml
+
+[cluster]
+# Role this node plays: "inference", "kv_cold", "ssm_cold"
+role = "inference"
+
+[cluster.kv_cold]
+# Cold storage node for KVCache layers (full-attention, typically ~10 layers)
+host = "192.168.50.11"
+port = 50051
+
+[cluster.ssm_cold]
+# Cold storage node for ArraysCache layers (linear-attention/SSM, typically ~30 layers)
+host = "192.168.10.174"
+port = 50051
+
+[cluster.recompute]
+# Inference node for KV recomputation on cache miss (usually localhost on inference node)
+host = "127.0.0.1"
+port = 50052
+
+[inference]
+# Path to your EXO installation (used by `tierkv install`)
+exo_path = "/home/user/exo/src/exo"
+
+# Log file for the EXO hook (on the inference node)
+log_file = "/tmp/tierkv.log"
+
+# Evict hot KV cache when RAM usage exceeds this fraction (0.0–1.0)
+memory_threshold = 0.60
+
+# KV head dimension for TurboQuant — must be divisible by 8
+# Qwen3.6-35B-A3B: 256 (full-attention head_dim)
+kv_dim = 256
+
+[vault]
+# Port for the ColdVault gRPC server on this node
+port = 50051
+
+# Optional: persist KV cache to disk across reboots (leave unset for in-memory only)
+# persist_path = "/var/lib/tierkv/cold_vault.db"
