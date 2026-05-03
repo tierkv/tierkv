@@ -152,6 +152,7 @@ def cmd_bench(args):
 
     # Try to find EXO API — default to standard port on kv_cold host or localhost
     exo_api = args.exo_api if hasattr(args, 'exo_api') and args.exo_api else "http://127.0.0.1:52415"
+    model_id = args.model if hasattr(args, 'model') and args.model else cfg.inference.model_id if hasattr(cfg.inference, 'model_id') else "Qwen/Qwen3.6-35B-A3B"
 
     LONG_PROMPT = "Explain the significance of distributed KV caching in large language model inference. " * 200
     SHORT_PROMPT = "Briefly define photosynthesis in one sentence."
@@ -159,7 +160,7 @@ def cmd_bench(args):
     def ttft(prompt: str, label: str) -> float:
         import json, urllib.request
         body = json.dumps({
-            "model": "default",
+            "model": model_id,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 80,
             "enable_thinking": False,
@@ -221,6 +222,7 @@ def main():
     # bench
     p_bench = sub.add_parser("bench", help="Run cold→restore TTFT benchmark")
     p_bench.add_argument("--exo-api", metavar="URL", help="EXO API base URL (default: http://127.0.0.1:52415)")
+    p_bench.add_argument("--model", metavar="MODEL_ID", help="Model ID to use (default: Qwen/Qwen3.6-35B-A3B)")
 
     args = parser.parse_args()
 
