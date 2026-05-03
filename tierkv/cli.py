@@ -42,7 +42,12 @@ def cmd_vault(args):
 
 def cmd_install(args):
     """Install the tierkv hook into an EXO installation."""
+    import importlib.metadata
+    import os
+    import platform
+    import re
     import shutil
+    import subprocess
     from pathlib import Path
     from tierkv.config import load_config
 
@@ -63,12 +68,70 @@ def cmd_install(args):
     shutil.copy(hook_src, hook_dst)
     print(f"[tierkv install] Copied hook → {hook_dst}")
 
+    # Install tierkv into EXO's venv so the hook can import it
+    # EXO venv is expected at {exo_path}/../../../.venv (i.e. exo repo root/.venv)
+    exo_repo_root = exo_path.parent.parent.parent
+    venv_python = None
+    for candidate in [
+        exo_repo_root / ".venv" / "bin" / "python",
+        exo_repo_root / ".venv" / "bin" / "python3",
+    ]:
+        if candidate.exists():
+            venv_python = candidate
+            break
+
+    if venv_python:
+        tierkv_version = importlib.metadata.version("tierkv-core")
+        system = platform.system()
+        machine = platform.machine()
+        if system == "Darwin":
+            wheel_file = f"tierkv_core-{tierkv_version}-cp39-abi3-macosx_11_0_arm64.whl"
+        elif machine == "aarch64":
+            wheel_file = f"tierkv_core-{tierkv_version}-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
+        else:
+            wheel_file = f"tierkv_core-{tierkv_version}-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+        wheel_url = f"https://github.com/tierkv/tierkv/releases/download/v{tierkv_version}/{wheel_file}"
+
+        # tierkv Python package lives alongside this file
+        tierkv_pkg_root = Path(__file__).parent.parent
+
+        def _run_pip(python, *install_args):
+            result = subprocess.run(
+                [str(python), "-m", "pip", "install", "--quiet", "--no-warn-script-location", *install_args],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                uv = shutil.which("uv")
+                if uv:
+                    result = subprocess.run(
+                        [uv, "pip", "install", "--quiet", "--python", str(python), *install_args],
+                        capture_output=True, text=True,
+                    )
+            return result
+
+        r = _run_pip(venv_python, wheel_url)
+        if r.returncode == 0:
+            print(f"[tierkv install] Installed tierkv-core=={tierkv_version} into EXO venv")
+        else:
+            print(f"[tierkv install] Warning: could not install tierkv-core into EXO venv:")
+            print(f"                 {r.stderr.strip().splitlines()[-1] if r.stderr.strip() else 'unknown error'}")
+            print(f"                 Run manually: {venv_python} -m pip install {wheel_url}")
+
+        r2 = _run_pip(venv_python, "--no-deps", str(tierkv_pkg_root))
+        if r2.returncode == 0:
+            print(f"[tierkv install] Installed tierkv into EXO venv")
+        else:
+            print(f"[tierkv install] Warning: could not install tierkv into EXO venv:")
+            print(f"                 Run manually: {venv_python} -m pip install --no-deps {tierkv_pkg_root}")
+    else:
+        print(f"[tierkv install] Warning: EXO venv not found at {exo_repo_root}/.venv")
+        print( "                 Install tierkv manually into EXO's Python environment.")
+
     # Patch memory threshold in EXO's cache.py
     cache_py = exo_path / "worker" / "engines" / "mlx" / "cache.py"
     if cache_py.exists():
         text = cache_py.read_text()
         threshold = cfg.inference.memory_threshold
-        # Insert threshold override at top of file if not already present
         marker = "# tierkv: memory threshold patch"
         if marker not in text:
             patch = f"{marker}\n_MEMORY_THRESHOLD = {threshold}\n"
@@ -93,7 +156,6 @@ def cmd_install(args):
                 "except Exception as _e:\n"
                 "    import logging; logging.getLogger(__name__).warning(f'tierkv hook failed to load: {_e}')\n"
             )
-            # Append at end of file so it runs after KVPrefixCache is initialized
             builder_py.write_text(text + hook_patch)
             print(f"[tierkv install] Patched builder.py → hook installs on EXO startup")
         else:
@@ -101,6 +163,39 @@ def cmd_install(args):
     else:
         print(f"[tierkv install] Warning: builder.py not found at {builder_py}")
         print( "                 Add manually: from tierkv.exo.hook import install_kv_tiering_hook")
+
+    # Copy tierkv.toml into EXO's working directory so the hook can find it
+    # Detect workdir: check systemd service file first, fall back to exo repo root
+    exo_workdir = None
+    for svc_path in [
+        Path("/etc/systemd/system/exo.service"),
+        Path.home() / ".config" / "systemd" / "user" / "exo.service",
+    ]:
+        if svc_path.exists():
+            m = re.search(r"WorkingDirectory=(.+)", svc_path.read_text())
+            if m:
+                exo_workdir = Path(m.group(1).strip())
+                break
+    if exo_workdir is None:
+        exo_workdir = exo_repo_root  # exo_path is .../exo/src/exo → root is 3 up
+
+    config_src = Path(args.config) if args.config else None
+    if config_src is None:
+        env_path = os.environ.get("TIERKV_CONFIG")
+        if env_path:
+            config_src = Path(env_path)
+        elif (Path.cwd() / "tierkv.toml").exists():
+            config_src = Path.cwd() / "tierkv.toml"
+
+    dst = exo_workdir / "tierkv.toml"
+    if config_src and config_src.resolve() != dst.resolve():
+        shutil.copy(config_src, dst)
+        print(f"[tierkv install] Copied tierkv.toml → {dst}")
+    elif dst.exists():
+        print(f"[tierkv install] tierkv.toml already in EXO workdir ({dst})")
+    else:
+        print(f"[tierkv install] Warning: no tierkv.toml found to copy.")
+        print(f"                 Place tierkv.toml at {dst} before starting EXO.")
 
     print("[tierkv install] Done. Restart EXO to activate.")
 
@@ -111,25 +206,27 @@ def cmd_status(args):
     cfg = load_config(args.config)
 
     nodes = [
-        ("kv_cold",   cfg.cluster.kv_cold.host,   cfg.cluster.kv_cold.port),
-        ("ssm_cold",  cfg.cluster.ssm_cold.host,   cfg.cluster.ssm_cold.port),
-        ("recompute", cfg.cluster.recompute.host,  cfg.cluster.recompute.port),
+        ("kv_cold",   cfg.cluster.kv_cold.host,   cfg.cluster.kv_cold.port,   True),
+        ("ssm_cold",  cfg.cluster.ssm_cold.host,   cfg.cluster.ssm_cold.port,  True),
+        ("recompute", cfg.cluster.recompute.host,  cfg.cluster.recompute.port, False),
     ]
 
     print(f"[tierkv status] Cluster role: {cfg.cluster.role}")
     print()
 
     all_ok = True
-    for name, host, port in nodes:
+    for name, host, port, required in nodes:
+        label = name if required else f"{name} (EXO internal — optional)"
         try:
             t0 = time.monotonic()
             s = socket.create_connection((host, port), timeout=3)
             s.close()
             ms = (time.monotonic() - t0) * 1000
-            print(f"  {name:12}  {host}:{port}  ✓  {ms:.1f}ms")
+            print(f"  {label:42}  {host}:{port}  ✓  {ms:.1f}ms")
         except Exception as e:
-            print(f"  {name:12}  {host}:{port}  ✗  ({e})")
-            all_ok = False
+            print(f"  {label:42}  {host}:{port}  ✗  ({e})")
+            if required:
+                all_ok = False
 
     print()
     if all_ok:
@@ -144,15 +241,24 @@ def cmd_bench(args):
     from tierkv.config import load_config
     cfg = load_config(args.config)
 
-    try:
-        import httpx
-    except ImportError:
-        print("[tierkv bench] Error: httpx required — pip install httpx", file=sys.stderr)
-        sys.exit(1)
-
     # Try to find EXO API — default to standard port on kv_cold host or localhost
     exo_api = args.exo_api if hasattr(args, 'exo_api') and args.exo_api else "http://127.0.0.1:52415"
-    model_id = args.model if hasattr(args, 'model') and args.model else cfg.inference.model_id if hasattr(cfg.inference, 'model_id') else "Qwen/Qwen3.6-35B-A3B"
+
+    if hasattr(args, 'model') and args.model:
+        model_id = args.model
+    else:
+        import json as _json, urllib.request as _urlreq, urllib.error as _urlerr
+        try:
+            with _urlreq.urlopen(f"{exo_api}/v1/models", timeout=5) as r:
+                models = _json.loads(r.read()).get("data", [])
+            if not models:
+                print("[tierkv bench] Error: no models loaded in EXO — send a /place_instance request first", file=sys.stderr)
+                sys.exit(1)
+            model_id = models[0]["id"]
+            print(f"[tierkv bench] Auto-detected model: {model_id}")
+        except _urlerr.URLError as e:
+            print(f"[tierkv bench] Error: cannot reach EXO API at {exo_api}: {e}", file=sys.stderr)
+            sys.exit(1)
 
     LONG_PROMPT = "Explain the significance of distributed KV caching in large language model inference. " * 200
     SHORT_PROMPT = "Briefly define photosynthesis in one sentence."
