@@ -20,9 +20,9 @@ Tested on Qwen3.6-35B-A3B (70 GB BF16) across a DGX Spark + Mac Pro + Mac Air cl
 ## How It Works
 
 ```
-  Inference node (DGX)
+  DGX Spark — inference only
   ┌─────────────────────────────────┐
-  │  EXO + Qwen3.6-35B-A3B (BF16)  │
+  │  EXO + Qwen3.6-35B-A3B (BF16)  │  ← EXO runs HERE only
   │  KVPrefixCache (GPU hot tier)   │
   │         │ evict (60% RAM)       │
   │         ▼                       │
@@ -31,15 +31,15 @@ Tested on Qwen3.6-35B-A3B (70 GB BF16) across a DGX Spark + Mac Pro + Mac Air cl
        │ KVCache       │ ArraysCache
        │ (10 layers)   │ (30 layers)
        ▼               ▼
-  Mac Pro LAN      Mac Air WiFi
+  Mac Pro LAN      Mac Air WiFi       ← cold storage only, no EXO
   0.5ms RTT        6ms RTT
-  ColdVault        ColdVault
+  tierkv vault     tierkv vault
   (in-memory)      (in-memory)
 ```
 
 **Three tiers:**
 
-- **Hot** — EXO's GPU KVPrefixCache. Fast, limited. Evicts at 60% RAM.
+- **Hot** — EXO's GPU KVPrefixCache on the inference node. Fast, limited. Evicts at 60% RAM.
 - **Cold KV** — Full-attention layers (KVCache/RotatingKVCache) shipped to a LAN node via gRPC, compressed with TurboQuant INT8 (~3.9× ratio, ≥52 dB SNR).
 - **Cold SSM** — Linear-attention layers (ArraysCache) shipped to a second node. Qwen3.6-35B-A3B is a hybrid MoE — 10/40 layers use full attention, 30/40 use linear attention.
 
@@ -53,66 +53,92 @@ Layer types are **auto-detected** via `isinstance` checks — no manual layer in
 
 You need at least 2 machines: one running inference, one as cold storage. Three machines lets you split KV and SSM tiers across separate nodes for better throughput.
 
-| Role | Requirement | Example |
+| Role | What runs on it | Example |
 |---|---|---|
-| `inference` | GPU with enough VRAM for your model | DGX Spark |
-| `kv_cold` | RAM to hold compressed KV layers | Mac Pro (32 GB) |
-| `ssm_cold` | RAM to hold SSM state | Mac Air (16 GB) |
+| `inference` | EXO + your model + tierkv hook | DGX Spark |
+| `kv_cold` | `tierkv vault` only (no EXO) | Mac Pro (32 GB) |
+| `ssm_cold` | `tierkv vault` only (no EXO) | Mac Air (16 GB) |
+
+**EXO only runs on the inference node.** The cold-tier machines (Mac Pro, Mac Air) only run the tierkv vault server — a lightweight gRPC process that holds KV data in RAM.
 
 ---
 
 ## Installation
 
-**Prerequisites:** Rust toolchain, Python 3.9+, EXO installed on the inference node.
-
-```bash
-git clone https://github.com/tierkv/tierkv.git
-cd tierkv
-
-# Build the Rust extension
-cd tierkv-core && maturin develop --release && cd ..
-
-# Install Python package
-pip install -e .
-```
-
-Or once wheels are available on a release:
+Download the prebuilt wheel for your platform from the [latest release](https://github.com/tierkv/tierkv/releases):
 
 ```bash
 pip install tierkv
 ```
 
+**Or build from source** (requires Rust toolchain):
+
+```bash
+git clone https://github.com/tierkv/tierkv.git
+cd tierkv
+cd tierkv-core && maturin develop --release && cd ..
+pip install -e .
+```
+
+Prebuilt wheels are available for:
+- Linux aarch64 (DGX Spark, Jetson, ARM servers)
+- Linux x86_64
+- macOS arm64 (Apple Silicon — Mac Pro, Mac Air)
+
 ---
 
-## Configuration
+## Setup — Step by Step
 
-Copy the example config and fill in your cluster IPs:
+tierkv runs on **all three machines**, but each machine has a different role and a different config. Install tierkv on every node first, then configure each one.
+
+### Step 1 — Configure each machine
+
+Each machine gets its own `tierkv.toml` with its role and the addresses of the other nodes. Copy the example and edit it:
 
 ```bash
 cp tierkv.toml.example tierkv.toml
 ```
 
+**On the inference node (DGX Spark)** — set `role = "inference"` and point to the cold nodes:
+
 ```toml
 [cluster]
-role = "inference"          # "inference" | "kv_cold" | "ssm_cold"
+role = "inference"
 
 [cluster.kv_cold]
-host = "192.168.50.11"      # LAN address of your KV cold node
+host = "192.168.50.11"      # Mac Pro LAN IP
 port = 50051
 
 [cluster.ssm_cold]
-host = "192.168.10.174"     # WiFi address of your SSM cold node
+host = "192.168.10.174"     # Mac Air WiFi IP
 port = 50051
 
 [cluster.recompute]
-host = "127.0.0.1"          # Usually localhost on inference node
+host = "127.0.0.1"
 port = 50052
 
 [inference]
-exo_path = "/home/user/exo/src/exo"
+exo_path = "/home/user/exo/src/exo"   # path to your EXO installation
 log_file  = "/tmp/tierkv.log"
-memory_threshold = 0.60     # Evict hot KV when RAM exceeds 60%
-kv_dim   = 256              # head_dim for TurboQuant (Qwen3.6-35B-A3B = 256)
+memory_threshold = 0.60
+kv_dim   = 256
+```
+
+**On the KV cold node (Mac Pro)** — set `role = "kv_cold"`, addresses don't matter here:
+
+```toml
+[cluster]
+role = "kv_cold"
+
+[vault]
+port = 50051
+```
+
+**On the SSM cold node (Mac Air)** — set `role = "ssm_cold"`:
+
+```toml
+[cluster]
+role = "ssm_cold"
 
 [vault]
 port = 50051
@@ -120,36 +146,36 @@ port = 50051
 
 `tierkv.toml` is gitignored — it contains your private IPs. Only `tierkv.toml.example` is committed.
 
----
+### Step 2 — Start vault servers on cold nodes
 
-## Usage
-
-### 1. Start cold vault servers
-
-On each cold-tier machine (`kv_cold` and `ssm_cold`):
+On **Mac Pro** and **Mac Air** (not on DGX):
 
 ```bash
-tierkv vault --port 50051
+tierkv vault
 ```
 
-Or as a background service (macOS launchd / Linux systemd).
+This starts the ColdVault gRPC server that the inference node will send KV data to. Keep it running as a background service (macOS launchd / Linux systemd).
 
-### 2. Install the EXO hook
+### Step 3 — Install the EXO hook on the inference node
 
-On the inference node:
+On **DGX only**:
 
 ```bash
 tierkv install --exo-path /path/to/exo/src/exo
 ```
 
-Then add to EXO's `builder.py` (after `KVPrefixCache` is initialized):
+Then add two lines to EXO's `builder.py`, after `KVPrefixCache` is initialized:
 
 ```python
 from tierkv.exo.hook import install_kv_tiering_hook
 install_kv_tiering_hook()
 ```
 
-### 3. Check cluster status
+Restart EXO. The hook will load `tierkv.toml` from the current directory and connect to the cold nodes automatically.
+
+### Step 4 — Verify
+
+From the **inference node**, check all nodes are reachable:
 
 ```bash
 tierkv status
@@ -165,7 +191,7 @@ tierkv status
 [tierkv status] All nodes reachable.
 ```
 
-### 4. Run benchmark
+### Step 5 — Benchmark
 
 ```bash
 tierkv bench --exo-api http://192.168.50.11:52415
@@ -196,7 +222,7 @@ recovered  = q.decode(compressed)  # ≥52 dB SNR
 
 **Why not standard KV offloading?** Most KV offload systems evict to local SSD or CPU RAM on the same machine. tierkv evicts across the network to separate machines, letting idle hardware on your LAN participate in serving long-context requests.
 
-**Why EXO?** [EXO](https://github.com/exo-explore/exo) provides an OpenAI-compatible API layer and handles model loading across Apple Silicon and CUDA devices. tierkv monkey-patches EXO's `KVPrefixCache` eviction and retrieval paths without modifying EXO's core.
+**Why EXO?** [EXO](https://github.com/exo-explore/exo) provides an OpenAI-compatible API layer and handles model loading across Apple Silicon and CUDA devices. tierkv monkey-patches EXO's `KVPrefixCache` eviction and retrieval paths without modifying EXO's core. EXO runs only on the inference node — cold nodes run only the tierkv vault.
 
 **What about multi-node inference?** EXO supports pipeline-parallel inference (splitting layers across machines). tierkv is currently designed for single-node inference with distributed cold storage. The two can coexist but require separate configuration.
 
@@ -206,9 +232,9 @@ recovered  = q.decode(compressed)  # ≥52 dB SNR
 
 | Node | Role | Memory | Network |
 |---|---|---|---|
-| DGX Spark | Inference (Qwen3.6-35B-A3B BF16) | 128 GB | WiFi + 10GbE LAN |
-| Mac Pro (M2 Pro) | KV cold tier | 32 GB | 10GbE LAN (0.5ms) |
-| Mac Air (M2) | SSM cold tier | 16 GB | WiFi (6ms) |
+| DGX Spark | Inference — EXO + Qwen3.6-35B-A3B BF16 | 128 GB | WiFi + 10GbE LAN |
+| Mac Pro (M2 Pro) | KV cold tier — tierkv vault only | 32 GB | 10GbE LAN (0.5ms to DGX) |
+| Mac Air (M2) | SSM cold tier — tierkv vault only | 16 GB | WiFi (6ms to DGX) |
 
 Over one test session: 227 evictions, 6 successful cold restores, ~26s saved per restore.
 
