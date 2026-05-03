@@ -20,3 +20,5 @@ target/
 *.so
 *.dylib
 *.pyd
+blog_hailey_turbo.md
+CLAUDE.md
