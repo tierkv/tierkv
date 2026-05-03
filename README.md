@@ -164,14 +164,12 @@ On **DGX only**:
 tierkv install --exo-path /path/to/exo/src/exo
 ```
 
-Then add two lines to EXO's `builder.py`, after `KVPrefixCache` is initialized:
+That's it. This command:
+1. Copies the tierkv hook into EXO's engine directory
+2. Patches EXO's `cache.py` to set the memory eviction threshold
+3. Patches EXO's `builder.py` to auto-load the hook on startup
 
-```python
-from tierkv.exo.hook import install_kv_tiering_hook
-install_kv_tiering_hook()
-```
-
-Restart EXO. The hook will load `tierkv.toml` from the current directory and connect to the cold nodes automatically.
+Restart EXO. The hook reads `tierkv.toml` from the working directory and connects to the cold nodes automatically.
 
 ### Step 4 — Verify
 

@@ -78,12 +78,31 @@ def cmd_install(args):
         else:
             print(f"[tierkv install] cache.py already patched (skipping)")
 
-    print("""
-[tierkv install] Done. Add to EXO's builder.py:
+    # Patch builder.py to install the hook automatically on EXO startup
+    builder_py = exo_path / "worker" / "engines" / "mlx" / "builder.py"
+    if builder_py.exists():
+        text = builder_py.read_text()
+        marker = "# tierkv: hook install"
+        if marker not in text:
+            hook_patch = (
+                "\n"
+                f"{marker}\n"
+                "try:\n"
+                "    from tierkv.exo.hook import install_kv_tiering_hook\n"
+                "    install_kv_tiering_hook()\n"
+                "except Exception as _e:\n"
+                "    import logging; logging.getLogger(__name__).warning(f'tierkv hook failed to load: {_e}')\n"
+            )
+            # Append at end of file so it runs after KVPrefixCache is initialized
+            builder_py.write_text(text + hook_patch)
+            print(f"[tierkv install] Patched builder.py → hook installs on EXO startup")
+        else:
+            print(f"[tierkv install] builder.py already patched (skipping)")
+    else:
+        print(f"[tierkv install] Warning: builder.py not found at {builder_py}")
+        print( "                 Add manually: from tierkv.exo.hook import install_kv_tiering_hook")
 
-    from tierkv.exo.hook import install_kv_tiering_hook
-    install_kv_tiering_hook()
-""")
+    print("[tierkv install] Done. Restart EXO to activate.")
 
 
 def cmd_status(args):
