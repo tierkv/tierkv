@@ -27,6 +27,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
       - name: Build wheel (${{ matrix.target }})
         uses: PyO3/maturin-action@v1
         with:
@@ -34,6 +38,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist --strip
           manylinux: auto
+          before-script-linux: yum install -y protobuf-compiler || (apt-get update && apt-get install -y protobuf-compiler)
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
