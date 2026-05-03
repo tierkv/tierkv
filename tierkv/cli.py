@@ -69,8 +69,9 @@ def cmd_install(args):
     print(f"[tierkv install] Copied hook → {hook_dst}")
 
     # Install tierkv into EXO's venv so the hook can import it
-    # EXO venv is expected at {exo_path}/../../../.venv (i.e. exo repo root/.venv)
-    exo_repo_root = exo_path.parent.parent.parent
+    # EXO venv is expected at {exo_path}/../../.venv (i.e. exo repo root/.venv)
+    # exo_path = …/exo/src/exo → parent.parent = …/exo (repo root)
+    exo_repo_root = exo_path.parent.parent
     venv_python = None
     for candidate in [
         exo_repo_root / ".venv" / "bin" / "python",
@@ -177,7 +178,7 @@ def cmd_install(args):
                 exo_workdir = Path(m.group(1).strip())
                 break
     if exo_workdir is None:
-        exo_workdir = exo_repo_root  # exo_path is .../exo/src/exo → root is 3 up
+        exo_workdir = exo_repo_root  # exo_path is .../exo/src/exo → repo root is 2 up
 
     config_src = Path(args.config) if args.config else None
     if config_src is None:
