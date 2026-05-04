@@ -305,6 +305,45 @@ pip install vllm
 
 ---
 
+### vLLM launch fails: `FileNotFoundError: 'ninja'`
+
+**Symptom:** vLLM starts loading the model (safetensors shards complete), then crashes during warmup with:
+```
+FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+RuntimeError: Engine core initialization failed.
+```
+
+**Root cause:** FlashInfer JIT-compiles CUTLASS MoE kernels for SM120 (GB10 / DGX Spark) on first launch. The JIT build requires `ninja`.
+
+**Fix:**
+```bash
+sudo apt-get install -y ninja-build
+pip install ninja   # also adds it to the venv PATH
+```
+
+---
+
+### vLLM `--kv-transfer-config` connector not found
+
+**Symptom:** vLLM exits immediately with:
+```
+pydantic_core.ValidationError: Unsupported connector type: tierkv.connectors.vllm.connector.TierKVConnector
+```
+
+**Root cause:** The vLLM KV connector factory has two loading modes: (1) short registered name, (2) module path + class name via `kv_connector_module_path`. Passing the full dotted path as `kv_connector` matches neither.
+
+**Fix:** Split into class name + module path:
+```json
+{
+  "kv_connector": "TierKVConnector",
+  "kv_connector_module_path": "tierkv.connectors.vllm.connector",
+  "kv_role": "kv_both",
+  "kv_connector_extra_config": {"config_path": "/path/to/tierkv.toml"}
+}
+```
+
+---
+
 ### kv_dim for vLLM connector
 
 The vLLM connector reads `kv_dim` from `tierkv.toml` (under `[tierkv]` or `[inference]`) or from `--kv-connector-extra-config`. Same rule applies as for the EXO hook — must match your model's attention head dimension. See [kv_dim table above](#kv_dim--the-silent-corruption-trap).

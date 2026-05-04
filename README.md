@@ -247,8 +247,12 @@ Same as for EXO — start `tierkv vault` on Mac Pro and Mac Air before launching
 
 ```bash
 vllm serve Qwen/Qwen3.6-35B-A3B \
-  --kv-connector tierkv.connectors.vllm.connector.TierKVConnector \
-  --kv-connector-extra-config '{"config_path": "/path/to/tierkv.toml"}' \
+  --kv-transfer-config '{
+    "kv_connector": "TierKVConnector",
+    "kv_connector_module_path": "tierkv.connectors.vllm.connector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {"config_path": "/path/to/tierkv.toml"}
+  }' \
   --enable-prefix-caching \
   --block-size 16
 ```
@@ -257,19 +261,25 @@ Or pass config inline without a TOML file:
 
 ```bash
 vllm serve Qwen/Qwen3.6-35B-A3B \
-  --kv-connector tierkv.connectors.vllm.connector.TierKVConnector \
-  --kv-connector-extra-config '{
-    "kv_cold_host": "192.168.50.11",
-    "kv_cold_port": 50051,
-    "ssm_cold_host": "192.168.10.174",
-    "ssm_cold_port": 50051,
-    "kv_dim": 256,
-    "turbo_quant": true,
-    "block_size": 16
+  --kv-transfer-config '{
+    "kv_connector": "TierKVConnector",
+    "kv_connector_module_path": "tierkv.connectors.vllm.connector",
+    "kv_role": "kv_both",
+    "kv_connector_extra_config": {
+      "kv_cold_host": "192.168.50.11",
+      "kv_cold_port": 50051,
+      "ssm_cold_host": "192.168.10.174",
+      "ssm_cold_port": 50051,
+      "kv_dim": 256,
+      "turbo_quant": true,
+      "block_size": 16
+    }
   }' \
   --enable-prefix-caching \
   --block-size 16
 ```
+
+> **Note:** vLLM 0.20+ uses `--kv-transfer-config` (not `--kv-connector` / `--kv-connector-extra-config`). The connector must be specified as `kv_connector` (class name) + `kv_connector_module_path` (module path) — passing the full dotted path as `kv_connector` will fail.
 
 ### How it works
 

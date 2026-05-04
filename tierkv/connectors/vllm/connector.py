@@ -19,12 +19,14 @@ try:
         KVConnectorBase_V1,
         KVConnectorMetadata,
         KVConnectorRole,
+        SupportsHMA,
     )
 except ImportError:
     # Allow import without vLLM installed (testing, EXO-only installs)
     KVConnectorBase_V1 = object
     KVConnectorMetadata = object
     KVConnectorRole = None
+    SupportsHMA = object
 
 from tierkv.connectors.vllm.block_registry import BlockRegistry
 from tierkv.connectors.vllm.request_handler import RequestHandler
@@ -41,7 +43,7 @@ class TierKVMeta:
     restore_plan: dict[str, list[str]] = field(default_factory=dict)
 
 
-class TierKVConnector(KVConnectorBase_V1):
+class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
     """
     TierKV cold tier for vLLM.
 
@@ -49,6 +51,10 @@ class TierKVConnector(KVConnectorBase_V1):
     - Stores blocks only when vLLM evicts them (request_finished)
     - Restores blocks on cache miss (start_load_kv)
     - save_kv_layer is a no-op
+
+    Inherits SupportsHMA so vLLM keeps the Hybrid KV Cache Manager (HMA) enabled.
+    HMA is required for hybrid models like Qwen3.5 MoE that mix full-attention
+    and linear-attention (SSM) layers.
     """
 
     def __init__(self, vllm_config, role: KVConnectorRole, kv_cache_config=None):
@@ -161,6 +167,23 @@ class TierKVConnector(KVConnectorBase_V1):
             for r in pending
         ]
         return True, None
+
+    def request_finished_all_groups(
+        self,
+        request,
+        block_ids: "tuple[list[int], ...]",
+    ) -> tuple[bool, Optional[dict]]:
+        """
+        HMA variant of request_finished — called once for all KV cache groups.
+        Required to support hybrid models (Qwen3.5 MoE) where vLLM uses the
+        Hybrid KV Cache Manager (HMA) with separate groups for full-attention
+        and SSM layers.
+
+        Our registry is hash-based so the group structure doesn't affect logic.
+        Flatten all group block_ids and delegate to request_finished.
+        """
+        flat_ids = [bid for group in block_ids for bid in group]
+        return self.request_finished(request, flat_ids)
 
     def build_connector_meta(self, scheduler_output) -> TierKVMeta:
         """Package store/restore plans into metadata for the worker."""
