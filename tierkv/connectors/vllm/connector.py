@@ -65,6 +65,15 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
             extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
         self.cfg = VllmConnectorConfig.from_dict(extra)
 
+        # Actual vLLM block size — may differ from cfg.block_size for hybrid
+        # models (HMA) where the Mamba page size forces a larger alignment
+        # (e.g. Qwen3.5 MoE uses 1056 tokens/block despite --block-size 16).
+        # This is set by vLLM after KV cache initialization, so it reflects
+        # the true token count per GPU KV block.
+        self._vllm_block_size: int = getattr(
+            vllm_config.cache_config, "block_size", self.cfg.block_size
+        )
+
         self.registry = BlockRegistry()
         self.context_tracker = ContextTracker()
 
@@ -146,7 +155,7 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         if not self.request_handler.should_store(block_hashes):
             return False, None
 
-        block_size = self.cfg.block_size
+        block_size = self._vllm_block_size
         total_tokens = getattr(request, "num_tokens", len(block_hashes) * block_size)
         num_tokens_per_block = [
             min(block_size, max(0, total_tokens - i * block_size))
@@ -159,6 +168,13 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         if extra_meta and isinstance(extra_meta, dict):
             context_id = extra_meta.get("tierkv_context_id")
 
+        # Build a hash→block_id map from the block_ids vLLM passes us.
+        # block_ids are the physical GPU block IDs in the same order as block_hashes.
+        hash_to_block_id: dict[bytes, int] = {}
+        for i, bh in enumerate(block_hashes):
+            if bh is not None and i < len(block_ids):
+                hash_to_block_id[bh] = block_ids[i]
+
         pending = self.request_handler.register_pending(
             block_hashes=block_hashes,
             num_tokens_per_block=num_tokens_per_block,
@@ -169,7 +185,7 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
             return False, None
 
         self._store_plans[request.request_id] = [
-            (r.block_hash.hex(), r.layer_type, r.num_tokens)
+            (r.block_hash.hex(), hash_to_block_id.get(r.block_hash), r.layer_type, r.num_tokens)
             for r in pending
         ]
         return True, None
@@ -235,6 +251,10 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
                 self._worker_execute_store, request_id, block_specs, forward_context
             )
 
+    def register_kv_caches(self, kv_caches) -> None:
+        """Store reference to GPU KV cache tensors (called once by vLLM worker)."""
+        self._kv_caches = kv_caches
+
     def _worker_execute_store(self, request_id: str, block_specs: list, forward_context):
         """
         Worker-side tensor extraction and store.
@@ -242,33 +262,45 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         Reads KV tensors from vLLM's paged GPU buffer, serializes them,
         and dispatches to request_handler.worker_store for quantization + gRPC.
 
+        block_specs: list of (block_hash_hex, block_id, layer_type, num_tokens)
+            block_id is the physical GPU block index, captured in request_finished
+            from the block_ids argument vLLM passes (same order as block_hashes).
+
         kv_caches layout (vLLM PagedAttention):
-            list[torch.Tensor], one per layer
-            Each: [2, num_blocks, block_size, num_heads, head_dim]
+            dict[str, torch.Tensor] or list[torch.Tensor], one entry per layer.
+            Each tensor: [2, num_blocks, block_size, num_heads, head_dim]
             Index 0 = keys, index 1 = values
         """
         import torch
 
         tensor_map: dict[bytes, bytes] = {}
-        block_ids_to_free: list[int] = []
-        kv_caches = getattr(forward_context, "kv_caches", None)
 
-        for block_hash_hex, layer_type, num_tokens in block_specs:
+        # kv_caches is set via register_kv_caches() (vLLM v1 worker hook).
+        # Fall back to forward_context for older vLLM versions.
+        kv_caches = getattr(self, "_kv_caches", None) or getattr(forward_context, "kv_caches", None)
+        if kv_caches is None:
+            for block_hash_hex, _block_id, _layer_type, _num_tokens in block_specs:
+                self.registry.mark_failed(bytes.fromhex(block_hash_hex))
+            return
+
+        # vLLM v1 register_kv_caches passes a dict {layer_name: tensor}
+        caches = list(kv_caches.values()) if isinstance(kv_caches, dict) else kv_caches
+
+        for block_hash_hex, block_id, layer_type, num_tokens in block_specs:
             block_hash = bytes.fromhex(block_hash_hex)
 
-            if kv_caches is None:
-                self.registry.mark_failed(block_hash)
-                continue
-
-            block_id = self._resolve_block_id(forward_context, block_hash_hex)
             if block_id is None:
                 self.registry.mark_failed(block_hash)
                 continue
 
             try:
                 layer_tensors = []
-                for kv_cache in kv_caches:
+                for kv_cache in caches:
                     if kv_cache is None:
+                        continue
+                    # Only read from full-attention KV caches: shape [2, num_blocks, ...]
+                    # SSM/Mamba caches have different shapes — skip them.
+                    if kv_cache.ndim < 3 or kv_cache.shape[0] != 2:
                         continue
                     layer_tensors.append(kv_cache[0, block_id, :num_tokens].contiguous())
                     layer_tensors.append(kv_cache[1, block_id, :num_tokens].contiguous())
@@ -278,31 +310,48 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
                         torch.cat(layer_tensors, dim=0)
                         .to(dtype=torch.float32).cpu().numpy().tobytes()
                     )
-                    block_ids_to_free.append(block_id)
                 else:
                     self.registry.mark_failed(block_hash)
             except Exception:
                 self.registry.mark_failed(block_hash)
 
-        def free_fn():
-            block_manager = getattr(forward_context, "block_manager", None)
-            if block_manager and block_ids_to_free:
-                try:
-                    block_manager.free_blocks(block_ids_to_free)
-                except Exception:
-                    pass
+        # Reconstruct BlockRecord objects on the worker side.
+        # The worker connector instance has an empty registry (scheduler and worker
+        # are separate processes in vLLM v1), so we build records from block_specs.
+        import time as _time
+        pending_records = []
+        for block_hash_hex, block_id, layer_type, num_tokens in block_specs:
+            block_hash = bytes.fromhex(block_hash_hex)
+            if block_hash not in tensor_map:
+                continue
+            from tierkv.connectors.vllm.block_registry import BlockRecord
+            client = (
+                self.ssm_client
+                if layer_type in ("ssm", "mamba", "linear_attention")
+                else self.kv_client
+            )
+            if client is None:
+                client = self.kv_client
+            pending_records.append(BlockRecord(
+                block_hash=block_hash,
+                vault_node=client.node_id,
+                vault_key="",
+                layer_type=layer_type,
+                num_tokens=num_tokens,
+                size_bytes=0,
+                evicted_at=_time.time(),
+                tensor_hash=b"",
+                status="pending",
+                context_id=None,
+                position=0,
+            ))
 
-        pending_records = [
-            r for r in (
-                self.registry._records.get(bytes.fromhex(h))
-                for h, _, _ in block_specs
-            ) if r is not None
-        ]
-
+        # free_fn: in vLLM v1 the scheduler handles block reclaim after
+        # request_finished returns True; we don't need to free explicitly here.
         self.request_handler.worker_store(
             pending_records=pending_records,
             tensor_map=tensor_map,
-            free_fn=free_fn,
+            free_fn=lambda: None,
         )
 
     def _resolve_block_id(self, forward_context, block_hash_hex: str) -> Optional[int]:
@@ -362,6 +411,9 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
 
                 for kv_cache in kv_caches:
                     if kv_cache is None:
+                        continue
+                    # Skip SSM/Mamba caches — only restore to full-attention [2, ...] tensors
+                    if kv_cache.ndim < 3 or kv_cache.shape[0] != 2:
                         continue
                     num_heads = kv_cache.shape[-2]
                     head_dim = kv_cache.shape[-1]
