@@ -111,16 +111,22 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
     def get_num_new_matched_tokens(
         self, request, num_computed_tokens: int
     ) -> tuple[Optional[int], bool]:
-        """Check cold tier for matching blocks beyond what's already computed."""
+        """Check cold tier for matching blocks beyond what's already computed.
+
+        Returns (ext_tokens, load_kv_async).
+        - ext_tokens=None means "can't schedule yet" → vLLM defers indefinitely.
+        - ext_tokens=0 means "no cold-tier match, schedule normally".
+        - ext_tokens>0 means "N tokens available in cold tier".
+        """
         block_hashes = getattr(request, "block_hashes", None)
         if not block_hashes:
-            return None, False
+            return 0, False
 
         matched_tokens, load_plan = self.restore_handler.plan(block_hashes)
         if matched_tokens > num_computed_tokens:
             self._restore_plans[request.request_id] = load_plan
             return matched_tokens - num_computed_tokens, False
-        return None, False
+        return 0, False
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens: int):
         pass
