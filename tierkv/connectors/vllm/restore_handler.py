@@ -23,6 +23,10 @@ class RestoreHandler:
     vLLM will re-prefill the affected request.
     """
 
+    # Pending blocks older than this are treated as failed during plan().
+    # Prevents a hung gRPC store from blocking prefix restore indefinitely.
+    PENDING_TTL_SECONDS: float = 30.0
+
     def __init__(
         self,
         registry: BlockRegistry,
@@ -47,8 +51,13 @@ class RestoreHandler:
         Stop at first miss — prefix must be contiguous.
         Only count "stored" blocks — not "pending".
 
+        Stale pending blocks (older than PENDING_TTL_SECONDS) are expired to
+        "failed" before the walk so they don't block the prefix indefinitely.
+
         Returns (matched_token_count, ordered_load_plan).
         """
+        self.registry.expire_pending(self.PENDING_TTL_SECONDS)
+
         load_plan: list[BlockRecord] = []
         for block_hash in block_hashes:
             record = self.registry.lookup_stored(block_hash)

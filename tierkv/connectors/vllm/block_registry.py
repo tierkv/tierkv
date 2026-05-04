@@ -96,6 +96,40 @@ class BlockRegistry:
                 rec.vault_key = vault_key
                 self._vault_index[vault_key] = block_hash
 
+    def purge_stale(self, max_age_seconds: float = 300.0) -> int:
+        """
+        Remove records that are no longer useful:
+        - failed records older than max_age_seconds
+        - stored records older than max_age_seconds (vault TTL cleanup)
+
+        Returns number of records removed.
+        """
+        cutoff = time.time() - max_age_seconds
+        to_remove = []
+        with self._lock:
+            for block_hash, rec in self._records.items():
+                if rec.evicted_at < cutoff and rec.status in ("failed", "stored"):
+                    to_remove.append(block_hash)
+        for block_hash in to_remove:
+            self.remove(block_hash)
+        return len(to_remove)
+
+    def expire_pending(self, ttl_seconds: float = 30.0) -> int:
+        """
+        Mark pending records that have been stuck longer than ttl_seconds as failed.
+        Prevents stale pending blocks from blocking prefix restore indefinitely.
+
+        Returns number of records transitioned.
+        """
+        cutoff = time.time() - ttl_seconds
+        expired = 0
+        with self._lock:
+            for rec in self._records.values():
+                if rec.status == "pending" and rec.evicted_at < cutoff:
+                    rec.status = "failed"
+                    expired += 1
+        return expired
+
     def stats(self) -> dict:
         with self._lock:
             statuses = [r.status for r in self._records.values()]

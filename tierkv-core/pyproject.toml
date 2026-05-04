@@ -7,3 +7,16 @@ name = "tierkv-core"
 version = "0.1.0"
 description = "Rust extension: TieredKVCache + TurboQuant + gRPC servers"
 requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["llm", "inference", "kv-cache", "rust"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/tierkv/tierkv"
+"Bug Tracker" = "https://github.com/tierkv/tierkv/issues"

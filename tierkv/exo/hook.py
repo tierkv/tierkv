@@ -49,11 +49,13 @@ def _get_cfg():
 
 def _setup_file_logging():
     cfg = _get_cfg()
+    import os
+    level = logging.DEBUG if os.environ.get("TIERKV_DEBUG") else logging.INFO
     fh = logging.FileHandler(cfg.inference.log_file)
-    fh.setLevel(logging.DEBUG)
+    fh.setLevel(level)
     fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     logging.getLogger().addHandler(fh)
-    logging.getLogger().setLevel(logging.DEBUG)
+    logging.getLogger().setLevel(level)
 
 
 _setup_file_logging()
