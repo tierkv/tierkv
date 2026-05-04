@@ -220,6 +220,112 @@ A speedup below **1.5×** means the cold tier isn't being hit — check `tierkv 
 
 ---
 
+## vLLM Integration
+
+tierkv ships a native **vLLM KV Connector** that plugs into vLLM's `KVConnectorBase_V1` API. It uses the same cold vault infrastructure as the EXO hook — the same `tierkv_core` Rust backend, the same `tierkv.toml` config, and the same gRPC vault servers on Mac Pro / Mac Air.
+
+**Tested with:** vLLM 0.20.1, torch 2.11.0+cu130, CUDA 13.0 on DGX Spark (aarch64).
+
+### Install vLLM
+
+```bash
+# Linux aarch64 (DGX Spark) — requires Python dev headers for fastsafetensors
+sudo apt-get install -y python3.12-dev
+pip install vllm tierkv
+```
+
+```bash
+# Linux x86_64 / macOS arm64
+pip install vllm tierkv
+```
+
+### Start vault servers
+
+Same as for EXO — start `tierkv vault` on Mac Pro and Mac Air before launching vLLM.
+
+### Launch vLLM with TierKV
+
+```bash
+vllm serve Qwen/Qwen3.6-35B-A3B \
+  --kv-connector tierkv.connectors.vllm.connector.TierKVConnector \
+  --kv-connector-extra-config '{"config_path": "/path/to/tierkv.toml"}' \
+  --enable-prefix-caching \
+  --block-size 16
+```
+
+Or pass config inline without a TOML file:
+
+```bash
+vllm serve Qwen/Qwen3.6-35B-A3B \
+  --kv-connector tierkv.connectors.vllm.connector.TierKVConnector \
+  --kv-connector-extra-config '{
+    "kv_cold_host": "192.168.50.11",
+    "kv_cold_port": 50051,
+    "ssm_cold_host": "192.168.10.174",
+    "ssm_cold_port": 50051,
+    "kv_dim": 256,
+    "turbo_quant": true,
+    "block_size": 16
+  }' \
+  --enable-prefix-caching \
+  --block-size 16
+```
+
+### How it works
+
+The vLLM connector uses a **reactive eviction model** — it intercepts vLLM's block eviction path, not a periodic snapshot:
+
+1. **Eviction** (`request_finished`): vLLM signals that GPU blocks are about to be freed. TierKV reads the KV tensors, quantizes them with TurboQuant INT8, and ships them to the cold vault over gRPC. GPU blocks are freed after the store completes.
+2. **Restore** (`get_num_new_matched_tokens` + `start_load_kv`): On the next request with the same prompt prefix, TierKV finds the blocks in the cold registry, fires a `BatchPromote` RPC, dequantizes, and writes directly into vLLM's paged KV buffer.
+3. **No-op save** (`save_kv_layer`): vLLM's eager save path is a no-op — eviction is the only trigger.
+
+The connector integrates as a standard vLLM [KV Transfer](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) plugin — no vLLM source changes needed.
+
+### Configuration reference
+
+All fields can be set in `tierkv.toml` under `[tierkv]` or passed via `--kv-connector-extra-config`:
+
+| Field | Default | Description |
+|---|---|---|
+| `kv_cold_host` | `127.0.0.1` | Cold vault host for full-attention KV layers |
+| `kv_cold_port` | `50051` | Cold vault port |
+| `ssm_cold_host` | `None` | Cold vault host for SSM/linear-attention layers (uses kv_cold if unset) |
+| `ssm_cold_port` | `50052` | SSM vault port |
+| `block_size` | `16` | Must match vLLM `--block-size` |
+| `kv_dim` | `128` | **Must match model head_dim** — see [Troubleshooting](TROUBLESHOOTING.md#kv_dim--the-silent-corruption-trap) |
+| `turbo_quant` | `true` | INT8 compression (~3.9× ratio) |
+| `max_inflight_stores` | `8` | Concurrent eviction-to-vault gRPC calls |
+| `max_inflight_promotes` | `4` | Concurrent restore-from-vault threads |
+
+> **kv_dim is critical.** Wrong value causes silent incorrect compression. Find the right value with:
+> ```python
+> from transformers import AutoConfig
+> cfg = AutoConfig.from_pretrained("your/model")
+> print(cfg.hidden_size // cfg.num_attention_heads)
+> ```
+
+### SDK hooks
+
+The connector exposes hooks for building proprietary audit or prioritization logic without forking tierkv:
+
+```python
+# Attach a callback fired after each successful block store:
+connector.register_store_callback(
+    lambda context_id, block_pos, vault_key: audit_log(context_id, vault_key)
+)
+
+# Tag a request so its blocks are tracked together:
+request.extra_metadata = {"tierkv_context_id": "session-abc"}
+
+# Query how many blocks are in cold storage for a session:
+count = connector.get_context_stored_count("session-abc")
+
+# Prioritize a context (0=normal, 1=high, 2=critical — higher = evicted last):
+connector.set_context_priority("session-abc", priority=2)
+```
+
+---
+
 ## TurboQuant
 
 tierkv includes a **per-group INT8 quantizer** for KV tensor compression before sending over the network.
@@ -258,6 +364,21 @@ recovered  = q.decode(compressed)  # ≥52 dB SNR
 | Mac Air (M2) | SSM cold tier — tierkv vault only | 16 GB | WiFi (6ms to DGX) |
 
 Over one test session: 227 evictions, 6 successful cold restores, ~26s saved per restore.
+
+---
+
+## Troubleshooting
+
+See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for documented failures and fixes, including:
+
+- gRPC 4 MB message size limit (silent empty responses)
+- `kv_dim` mismatch causing silent incorrect compression
+- `KVCache.offset` semantics and garbage output after restore
+- Stale semaphores after `kill -9`
+- EXO Nack loop and election storm after hard reset
+- SSH lockout during model load
+- Wrong platform wheel installed on Linux
+- vLLM `fastsafetensors` build failure on aarch64
 
 ---
 
