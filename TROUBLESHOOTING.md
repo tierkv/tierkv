@@ -278,6 +278,34 @@ def worker(channel):
 
 ## vLLM-Specific
 
+### Requests stuck in `waiting_by_reason=deferred` forever
+
+**Symptom:** vLLM starts, `/health` returns 200, but all inference requests hang indefinitely. vLLM metrics show `num_requests_waiting=1` and `num_requests_waiting_by_reason{reason="deferred"}=1` but `num_requests_running=0`. The request never completes.
+
+**Root cause:** `get_num_new_matched_tokens` returned `(None, False)` when no cold-tier match exists. In vLLM's scheduler, returning `None` means "can't determine matched tokens yet — defer request". The scheduler puts the request back in the waiting queue and never schedules it.
+
+**Fix:** Return `(0, False)` when there are no cold-tier matches. `0` means "zero external tokens matched, proceed with normal scheduling".
+
+**Wrong:**
+```python
+if not block_hashes:
+    return None, False  # defers forever!
+...
+return None, False  # also defers forever!
+```
+
+**Correct:**
+```python
+if not block_hashes:
+    return 0, False   # no match → schedule normally
+...
+return 0, False       # vault miss → schedule normally
+```
+
+Only return `None` if there is a genuine async lookup in flight and the answer is truly not yet available.
+
+---
+
 ### TierKVConnector import fails without vLLM installed
 
 This is expected. The connector has a graceful fallback:
