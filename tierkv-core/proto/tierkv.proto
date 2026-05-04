@@ -43,3 +43,36 @@ message RecomputeRequest {
 service RecomputeService {
   rpc Recompute (RecomputeRequest) returns (KVTensor);
 }
+
+// ── vLLM Cold Vault (block-hash addressed) ──────────────────────────────────
+
+message VllmBlockStoreRequest {
+  string block_hash_hex = 1;   // composite hash hex-encoded
+  string layer_type     = 2;   // "full_attention" | "sliding_window" | "ssm"
+  bytes  payload        = 3;   // TurboQuant INT8 or raw BF16
+  bool   is_quantized   = 4;
+  uint32 num_tokens     = 5;   // actual tokens in block (≤ block_size)
+}
+
+message VllmBlockStoreResponse {
+  string vault_key = 1;        // opaque key for BatchPromote
+}
+
+message VllmBatchPromoteRequest {
+  repeated string vault_keys = 1;
+}
+
+message VllmBatchPromoteResponse {
+  repeated VllmBlockData blocks = 1;
+}
+
+message VllmBlockData {
+  string block_hash_hex = 1;
+  bytes  payload        = 2;
+  bool   is_quantized   = 3;
+}
+
+service VllmColdVaultService {
+  rpc StoreBlock   (VllmBlockStoreRequest)   returns (VllmBlockStoreResponse);
+  rpc BatchPromote (VllmBatchPromoteRequest)  returns (VllmBatchPromoteResponse);
+}

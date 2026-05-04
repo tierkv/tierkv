@@ -14,17 +14,19 @@ mod turbo_quant;
 pub mod residual_sync;
 
 /// Start the ColdVault gRPC server in a background thread (non-blocking).
+/// Serves both EXO (ColdVaultService) and vLLM (VllmColdVaultService) on the same port.
 /// Call once at process startup on a cold-tier node.
 #[pyfunction]
 fn start_cold_vault_server(port: u16) -> PyResult<()> {
     std::thread::spawn(move || {
         let rt = Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
-            use residual_sync::cold_vault_server;
+            use residual_sync::{cold_vault_server, vllm_cold_vault_server};
             use tonic::transport::Server;
             let addr = format!("0.0.0.0:{port}").parse().expect("addr");
             Server::builder()
                 .add_service(cold_vault_server())
+                .add_service(vllm_cold_vault_server())
                 .serve(addr)
                 .await
                 .expect("ColdVault server error");

@@ -5,7 +5,7 @@ description = "3-tier distributed KV cache for LLM inference — preserve evicte
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-keywords = ["llm", "inference", "kv-cache", "distributed", "exo"]
+keywords = ["llm", "inference", "kv-cache", "distributed", "vllm", "exo"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -19,10 +19,21 @@ dependencies = [
     "tierkv-core",
     "grpcio>=1.64",
     "grpcio-tools>=1.64",
-    "httpx>=0.27",
     "numpy>=1.26",
-    "openai>=2.33.0",
     "rich>=15.0.0",
+]
+
+[project.optional-dependencies]
+exo = [
+    "httpx>=0.27",
+    "openai>=2.33.0",
+]
+vllm = [
+    "vllm>=0.8",
+]
+all = [
+    "tierkv[exo]",
+    "tierkv[vllm]",
 ]
 
 [project.urls]
@@ -31,6 +42,9 @@ Homepage = "https://github.com/prasannak/tierkv"
 
 [project.scripts]
 tierkv = "tierkv.cli:main"
+
+[project.entry-points."vllm.kv_connector"]
+tierkv = "tierkv.connectors.vllm.connector:TierKVConnector"
 
 [build-system]
 requires = ["hatchling"]

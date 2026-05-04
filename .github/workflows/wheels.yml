@@ -1,25 +1,49 @@
-name: Build wheels
+name: Build & Test Wheels
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
   workflow_dispatch:
 
 jobs:
+  # ── Python unit tests (no Rust needed) ────────────────────────────────────
+  test:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: pip install pytest grpcio numpy
+
+      - name: Run connector tests
+        run: pytest tierkv/connectors/vllm/tests/ -v
+
+  # ── Rust wheel builds ──────────────────────────────────────────────────────
   build-wheels:
-    name: Build ${{ matrix.target }}
+    name: Wheel — ${{ matrix.name }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
+          # DGX Spark target — this is the critical one
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             name: linux-aarch64
+          # x86_64 Linux (servers, cloud)
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             name: linux-x86_64
+          # Apple Silicon (Mac Pro + Mac Air vault servers)
           - os: macos-latest
             target: aarch64-apple-darwin
             name: macos-arm64
@@ -40,10 +64,71 @@ jobs:
         with:
           name: wheels-${{ matrix.name }}
           path: tierkv-core/dist/*.whl
+          retention-days: 7
 
+  # ── Python sdist (tierkv package itself) ──────────────────────────────────
+  build-sdist:
+    name: Python sdist
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist
+        run: |
+          pip install hatchling
+          python -m hatchling build --target sdist
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          retention-days: 7
+
+  # ── Summary: print download URLs on every master push ─────────────────────
+  summary:
+    name: Wheel download links
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+      - name: List all artifacts
+        run: |
+          echo "## Built artifacts" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          ls -lh dist/ >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Install on DGX (aarch64)" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          LINUX_WHEEL=$(ls dist/*aarch64*.whl 2>/dev/null | head -1 | xargs basename)
+          RUN_ID=${{ github.run_id }}
+          REPO=${{ github.repository }}
+          echo "# Download from GitHub Actions:" >> $GITHUB_STEP_SUMMARY
+          echo "gh run download ${RUN_ID} -R ${REPO} -n wheels-linux-aarch64" >> $GITHUB_STEP_SUMMARY
+          echo "uv pip install --force-reinstall ${LINUX_WHEEL}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  # ── Tag release: attach all wheels to GitHub Release ──────────────────────
   release:
     name: Publish to GitHub Release
-    needs: build-wheels
+    needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -56,11 +141,31 @@ jobs:
           merge-multiple: true
           path: dist/
 
-      - name: List wheels
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+      - name: List release artifacts
         run: ls -lh dist/
 
-      - name: Upload to GitHub Release
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.whl
+          files: dist/*
           generate_release_notes: true
+          body: |
+            ## Install
+
+            **DGX / Linux aarch64:**
+            ```bash
+            gh release download ${{ github.ref_name }} -R ${{ github.repository }} --pattern '*aarch64*linux*.whl'
+            uv pip install --force-reinstall tierkv_core-*aarch64*.whl
+            uv pip install "tierkv[vllm] @ https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/tierkv-*.tar.gz"
+            ```
+
+            **Mac Pro / Mac Air (Apple Silicon):**
+            ```bash
+            gh release download ${{ github.ref_name }} -R ${{ github.repository }} --pattern '*arm64*.whl'
+            uv pip install --force-reinstall tierkv_core-*arm64*.whl
+            ```
