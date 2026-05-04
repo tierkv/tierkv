@@ -11,6 +11,7 @@ Launch:
 from __future__ import annotations
 
 import concurrent.futures
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -110,6 +111,13 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
 
         self._restore_plans: dict[str, list] = {}
         self._store_plans: dict[str, list] = {}
+
+        # Worker side: request IDs whose cold-tier store has completed.
+        # Populated by free_fn in _worker_execute_store; drained by get_finished().
+        # get_finished() → KVConnectorOutput.finished_sending → scheduler frees blocks.
+        self._finished_sending: set[str] = set()
+        self._finished_sending_lock = threading.Lock()
+
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.cfg.max_inflight_promotes,
             thread_name_prefix="tierkv-worker",
@@ -346,12 +354,17 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
                 position=0,
             ))
 
-        # free_fn: in vLLM v1 the scheduler handles block reclaim after
-        # request_finished returns True; we don't need to free explicitly here.
+        # free_fn: called by RequestHandler._store_all after all stores complete
+        # (or fail). Adds request_id to _finished_sending so get_finished() can
+        # return it → KVConnectorOutput.finished_sending → scheduler frees blocks.
+        def _mark_done(req_id: str = request_id) -> None:
+            with self._finished_sending_lock:
+                self._finished_sending.add(req_id)
+
         self.request_handler.worker_store(
             pending_records=pending_records,
             tensor_map=tensor_map,
-            free_fn=lambda: None,
+            free_fn=_mark_done,
         )
 
     def _resolve_block_id(self, forward_context, block_hash_hex: str) -> Optional[int]:
@@ -443,6 +456,26 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
             import sys
             print(f"[tierkv] {stats['pending']} blocks pending vault confirmation",
                   file=sys.stderr)
+
+    def get_finished(
+        self, finished_req_ids: "set[str]"
+    ) -> "tuple[set[str] | None, set[str] | None]":
+        """
+        Worker-side: return request IDs whose cold-tier store has completed.
+
+        Called by the vLLM model runner after each forward pass.
+        Return value is packed into KVConnectorOutput.finished_sending and sent
+        to the scheduler, which then calls _free_blocks(request) to return GPU
+        blocks to the free pool.
+
+        Returns (sending_done, recving_done).
+        """
+        with self._finished_sending_lock:
+            if not self._finished_sending:
+                return None, None
+            done = self._finished_sending.copy()
+            self._finished_sending.clear()
+        return done, None
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
