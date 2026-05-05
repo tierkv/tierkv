@@ -99,7 +99,7 @@ class TestEvictionRecoveryCycle:
         # 4. Execute: fetches and returns tensor bytes
         result = restore.execute(plan)
         assert block_hash in result
-        assert result[block_hash] == tensor
+        assert result[block_hash][0] == tensor
 
     def test_multi_block_prefix_restore(self):
         """Three blocks evicted; all three restored in prefix order."""
@@ -132,7 +132,7 @@ class TestEvictionRecoveryCycle:
         result = restore.execute(plan)
         for h in hashes:
             assert h in result
-            assert result[h] == tensors[h]
+            assert result[h][0] == tensors[h]
 
     def test_partial_prefix_stops_at_gap(self):
         """Blocks 0,1 stored; block 2 missing. Plan returns only 0,1."""

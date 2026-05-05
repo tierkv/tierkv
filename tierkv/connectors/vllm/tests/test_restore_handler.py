@@ -91,7 +91,7 @@ class TestExecute:
 
         result = restore_handler.execute([rec])
         assert rec.block_hash in result
-        assert result[rec.block_hash] == payload
+        assert result[rec.block_hash][0] == payload
         assert len(mock_client.promote_calls) == 1
 
     def test_raises_on_hash_mismatch(self, restore_handler, registry, mock_client):
