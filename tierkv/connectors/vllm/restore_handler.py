@@ -68,10 +68,13 @@ class RestoreHandler:
         matched_tokens = sum(r.num_tokens for r in load_plan)
         return matched_tokens, load_plan
 
-    def execute(self, load_plan: list[BlockRecord]) -> dict[bytes, bytes]:
+    def execute(self, load_plan: list[BlockRecord]) -> dict[bytes, tuple[bytes, int]]:
         """
         Fires BatchPromote RPCs split by vault node.
-        Returns: block_hash -> dequantized tensor bytes.
+        Returns: block_hash -> (dequantized tensor bytes, num_tokens).
+
+        num_tokens is the token count that was stored for this block (may be
+        less than block_size for the last partial block of a request).
 
         Raises ValueError on tensor_hash mismatch.
         """
@@ -88,22 +91,22 @@ class RestoreHandler:
             if r.layer_type in ("ssm", "mamba", "linear_attention")
         ]
 
-        futures = {}
+        grpc_futures = {}
         if kv_records:
-            futures["kv"] = self._executor.submit(
+            grpc_futures["kv"] = self._executor.submit(
                 self.kv_client.batch_promote_sync,
                 [r.vault_key for r in kv_records],
             )
         if ssm_records:
-            futures["ssm"] = self._executor.submit(
+            grpc_futures["ssm"] = self._executor.submit(
                 self.ssm_client.batch_promote_sync,
                 [r.vault_key for r in ssm_records],
             )
 
-        results: dict[bytes, bytes] = {}
+        results: dict[bytes, tuple[bytes, int]] = {}
 
-        for key, future in futures.items():
-            blocks: list[VllmBlockData] = future.result()
+        for key, grpc_future in grpc_futures.items():
+            blocks: list[VllmBlockData] = grpc_future.result()
             records = kv_records if key == "kv" else ssm_records
 
             for block_data, record in zip(blocks, records):
@@ -118,14 +121,20 @@ class RestoreHandler:
                         f"— cold storage may be corrupted. Forcing re-prefill."
                     )
 
-                # Dequantize
+                # Dequantize — decode_into writes directly into a pre-allocated
+                # bytearray, eliminating the 3 × ~102 MB intermediate
+                # allocations that cause a page-fault storm inside vLLM's
+                # large mmap'd process.  decode_into also releases the GIL.
                 if block_data.is_quantized and self.turbo_quant:
                     from tierkv_core import TurboQuant
                     quant = TurboQuant(self._group_size)
-                    tensor = quant.decode(block_data.payload)
+                    decoded_len = quant.decoded_size(len(block_data.payload))
+                    buf = bytearray(decoded_len)
+                    quant.decode_into(block_data.payload, buf)
+                    tensor = buf  # bytearray satisfies buffer protocol — np.frombuffer accepts it
                 else:
                     tensor = block_data.payload
 
-                results[record.block_hash] = tensor
+                results[record.block_hash] = (tensor, record.num_tokens)
 
         return results

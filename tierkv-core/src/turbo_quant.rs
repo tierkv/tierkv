@@ -46,6 +46,64 @@ impl TurboQuant {
         Ok(f32_to_bytes(&floats))
     }
 
+    /// Decode per-group INT8 compressed bytes → flat f32 bytes.
+    /// Releases the GIL during computation so multiple calls from a Python
+    /// thread pool can run concurrently (each takes ~1-2s CPU-bound).
+    pub fn decode_nogil(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+        let dim = self.dim;
+        py.allow_threads(move || {
+            decode_grouped_inner(&data, dim)
+                .map(|floats| f32_to_bytes(&floats))
+        })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    }
+
+    /// Decode in-place into a pre-allocated bytearray.
+    ///
+    /// Zero intermediate allocations — avoids the page-fault storm from
+    /// three ~102 MB Vec allocations inside a large mmap'd vLLM process.
+    ///
+    /// `out` must be exactly `decoded_size(len(data))` bytes; returns the
+    /// number of bytes written.  Call `TurboQuant.decoded_size(compressed_len)`
+    /// to size the buffer before calling.
+    ///
+    /// Releases the GIL during the decode loop.
+    pub fn decode_into(
+        &self,
+        py: Python<'_>,
+        data: Vec<u8>,
+        out: pyo3::Bound<'_, pyo3::types::PyByteArray>,
+    ) -> PyResult<usize> {
+        use pyo3::types::PyByteArrayMethods;
+        let dim = self.dim;
+        // Grab the raw pointer + length while we hold the GIL, then cast to
+        // usize so the value is Send and can cross the allow_threads boundary.
+        // Safety: the bytearray must not be resized or shared across Python
+        // threads during this call — same contract as numpy's writable buffer.
+        let (out_ptr_usize, out_len) = unsafe {
+            let slice = out.as_bytes_mut();
+            (slice.as_mut_ptr() as usize, slice.len())
+        };
+        py.allow_threads(move || {
+            decode_grouped_into(&data, dim, out_ptr_usize as *mut u8, out_len)
+        })
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    }
+
+    /// Return the number of output bytes that `decode_into` will produce for
+    /// `compressed_len` bytes of input.  Raises ValueError if the length is
+    /// not a valid multiple of the group stride.
+    pub fn decoded_size(&self, compressed_len: usize) -> PyResult<usize> {
+        let stride = 4 + self.dim;
+        if compressed_len % stride != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "compressed_len {} is not a multiple of stride {} (4 + {})",
+                compressed_len, stride, self.dim,
+            )));
+        }
+        Ok((compressed_len / stride) * self.dim * 4)
+    }
+
     /// Approximate compression ratio (input bytes / output bytes).
     /// Per-group INT8: (dim × 4) / (dim + 4) ≈ 3.9× for dim=256.
     #[getter]
@@ -65,6 +123,11 @@ impl TurboQuant {
     /// Decode without going through PyO3.
     pub fn decode_bytes(&self, data: &[u8]) -> PyResult<Vec<f32>> {
         decode_grouped(data, self.dim)
+    }
+
+    /// Decode without GIL (pure Rust, no PyO3 error types).
+    pub fn decode_bytes_inner(&self, data: &[u8]) -> Result<Vec<f32>, String> {
+        decode_grouped_inner(data, self.dim)
     }
 }
 
@@ -98,27 +161,8 @@ fn encode_grouped(floats: &[f32], group_size: usize) -> Vec<u8> {
 /// Decode per-group INT8 bytes back to floats.
 /// Each group is [scale: f32 LE (4 bytes)] [quantized: i8 as u8 (group_size bytes)].
 fn decode_grouped(data: &[u8], group_size: usize) -> PyResult<Vec<f32>> {
-    if data.len() < 4 {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "INT8 encoded data must be at least 4 bytes (scale header)",
-        ));
-    }
-    let stride = 4 + group_size; // bytes per group
-    if data.len() % stride != 0 {
-        return Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "encoded data length {} is not a multiple of group stride {} (4 + {})",
-            data.len(), stride, group_size
-        )));
-    }
-    let n_groups = data.len() / stride;
-    let mut floats = Vec::with_capacity(n_groups * group_size);
-    for chunk in data.chunks_exact(stride) {
-        let scale = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
-        for &b in &chunk[4..] {
-            floats.push((b as i8) as f32 * scale);
-        }
-    }
-    Ok(floats)
+    decode_grouped_inner(data, group_size)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -135,8 +179,86 @@ fn bytes_to_f32(data: &[u8]) -> PyResult<Vec<f32>> {
         .collect())
 }
 
+/// Pure-Rust version of bytes_to_f32 — no GIL required.
+fn bytes_to_f32_inner(data: &[u8]) -> Result<Vec<f32>, String> {
+    if data.len() % 4 != 0 {
+        return Err("data length is not a multiple of 4".to_string());
+    }
+    Ok(data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect())
+}
+
 fn f32_to_bytes(floats: &[f32]) -> Vec<u8> {
     floats.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Zero-allocation in-place decode: writes decoded f32 LE bytes directly into
+/// `out_ptr[0..out_len]`.  Called from `decode_into` with the GIL released.
+///
+/// # Safety
+/// Caller must ensure `out_ptr` points to a valid writable buffer of exactly
+/// `out_len` bytes, and that no other thread touches that buffer concurrently.
+fn decode_grouped_into(
+    data: &[u8],
+    group_size: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+) -> Result<usize, String> {
+    if data.len() < 4 {
+        return Err("INT8 encoded data must be at least 4 bytes (scale header)".to_string());
+    }
+    let stride = 4 + group_size;
+    if data.len() % stride != 0 {
+        return Err(format!(
+            "encoded data length {} is not a multiple of group stride {} (4 + {})",
+            data.len(), stride, group_size
+        ));
+    }
+    let n_groups = data.len() / stride;
+    let expected_out = n_groups * group_size * 4;
+    if out_len != expected_out {
+        return Err(format!(
+            "output buffer length {} != expected {} ({} groups × {} floats × 4 bytes)",
+            out_len, expected_out, n_groups, group_size,
+        ));
+    }
+    // SAFETY: caller guarantees out_ptr is valid for out_len bytes.
+    let out: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
+    let mut write_pos = 0usize;
+    for chunk in data.chunks_exact(stride) {
+        let scale = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        for &b in &chunk[4..] {
+            let f: f32 = (b as i8) as f32 * scale;
+            out[write_pos..write_pos + 4].copy_from_slice(&f.to_le_bytes());
+            write_pos += 4;
+        }
+    }
+    Ok(write_pos)
+}
+
+/// Pure-Rust version of decode_grouped — no GIL required, safe for allow_threads.
+fn decode_grouped_inner(data: &[u8], group_size: usize) -> Result<Vec<f32>, String> {
+    if data.len() < 4 {
+        return Err("INT8 encoded data must be at least 4 bytes (scale header)".to_string());
+    }
+    let stride = 4 + group_size;
+    if data.len() % stride != 0 {
+        return Err(format!(
+            "encoded data length {} is not a multiple of group stride {} (4 + {})",
+            data.len(), stride, group_size
+        ));
+    }
+    let n_groups = data.len() / stride;
+    let mut floats = Vec::with_capacity(n_groups * group_size);
+    for chunk in data.chunks_exact(stride) {
+        let scale = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        for &b in &chunk[4..] {
+            floats.push((b as i8) as f32 * scale);
+        }
+    }
+    Ok(floats)
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -242,5 +364,48 @@ mod tests {
         assert!(tq.decode_bytes(&[0u8; 3]).is_err());
         assert!(tq.decode_bytes(&[0u8; 4]).is_err()); // 4 bytes not a full group (need 260)
         assert!(tq.decode_bytes(&[0u8; 260]).is_ok()); // one full group (4 scale + 256 values)
+    }
+
+    /// decode_into must produce bit-identical output to decode_bytes.
+    #[test]
+    fn decode_into_matches_decode_bytes() {
+        let dim = 128;
+        let n = 12_800;
+        let original = synthetic_kv(n);
+        let tq = TurboQuant::new(dim).unwrap();
+        let encoded = tq.encode_floats(&original);
+
+        // Reference path
+        let ref_bytes = f32_to_bytes(&tq.decode_bytes(&encoded).unwrap());
+
+        // decode_grouped_into path
+        let stride = 4 + dim;
+        let n_groups = encoded.len() / stride;
+        let out_len = n_groups * dim * 4;
+        let mut buf = vec![0u8; out_len];
+        let written = decode_grouped_into(&encoded, dim, buf.as_mut_ptr(), out_len).unwrap();
+
+        assert_eq!(written, out_len);
+        assert_eq!(buf, ref_bytes, "decode_into output differs from decode_bytes");
+    }
+
+    /// decoded_size formula: (compressed_len / stride) * dim * 4.
+    #[test]
+    fn decoded_size_formula() {
+        let dim = 256usize;
+        let stride = 4 + dim; // 260
+        let n_groups = 10usize;
+        let compressed_len = n_groups * stride; // 2600
+        let expected_decoded = n_groups * dim * 4; // 10240
+
+        // Test via the internal function directly.
+        let mut buf = vec![0u8; expected_decoded];
+        // Encode 10 groups of zeros
+        let zeros = vec![0.0f32; n_groups * dim];
+        let tq = TurboQuant::new(dim).unwrap();
+        let encoded = tq.encode_floats(&zeros);
+        assert_eq!(encoded.len(), compressed_len);
+        let written = decode_grouped_into(&encoded, dim, buf.as_mut_ptr(), expected_decoded).unwrap();
+        assert_eq!(written, expected_decoded);
     }
 }
