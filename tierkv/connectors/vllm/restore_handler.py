@@ -27,6 +27,13 @@ class RestoreHandler:
     # Prevents a hung gRPC store from blocking prefix restore indefinitely.
     PENDING_TTL_SECONDS: float = 30.0
 
+    # Maximum expected decoded block size.  Sized for a 1056-token HMA block
+    # at float32 with the largest head configuration we've seen in production.
+    # Pre-allocating and pre-touching this buffer at init eliminates the page-fault
+    # storm that would otherwise occur on the first decode call inside vLLM's
+    # large mmap'd process (~84 GB on DGX GB10).
+    _PREWARM_BYTES: int = 128 * 1024 * 1024  # 128 MiB
+
     def __init__(
         self,
         registry: BlockRegistry,
@@ -44,6 +51,32 @@ class RestoreHandler:
             max_workers=4,
             thread_name_prefix="tierkv-restore",
         )
+
+        # Pre-allocate a pool of decode buffers and pre-touch all their pages at
+        # init time, so that page faults happen here rather than during the
+        # latency-critical cold restore path.
+        #
+        # Without this, bytearray(102 MB) inside execute() faults ~25,600 OS
+        # pages at ~30 µs each inside vLLM's mmap-heavy process = ~0.77 s per
+        # block.  A pool of 8 pre-touched buffers covers all blocks in a typical
+        # cold restore batch without reallocation.
+        #
+        # decode_into accepts a buffer larger than the decoded output (writes to
+        # the first decoded_len bytes, ignores the rest), so each pool buffer can
+        # be reused across blocks of varying sizes.
+        self._pool_size = 8
+        if self.turbo_quant:
+            self._buf_pool: list[bytearray] = []
+            for _ in range(self._pool_size):
+                buf = bytearray(self._PREWARM_BYTES)
+                mv = memoryview(buf)
+                for offset in range(0, self._PREWARM_BYTES, 4096):
+                    mv[offset] = 0
+                self._buf_pool.append(buf)
+            self._pool_idx: int = 0
+        else:
+            self._buf_pool = []
+            self._pool_idx = 0
 
     def plan(self, block_hashes: list[bytes]) -> tuple[int, list[BlockRecord]]:
         """
@@ -129,9 +162,20 @@ class RestoreHandler:
                     from tierkv_core import TurboQuant
                     quant = TurboQuant(self._group_size)
                     decoded_len = quant.decoded_size(len(block_data.payload))
-                    buf = bytearray(decoded_len)
-                    quant.decode_into(block_data.payload, buf)
-                    tensor = buf  # bytearray satisfies buffer protocol — np.frombuffer accepts it
+                    # Pop a pre-warmed buffer from the pool — pages already
+                    # faulted in at init, zero page-fault overhead for the write.
+                    # decode_into accepts an oversized buffer (writes only the
+                    # first decoded_len bytes).  We return a memoryview slice so
+                    # np.frombuffer downstream gets a zero-copy view.
+                    if self._buf_pool and decoded_len <= self._PREWARM_BYTES:
+                        pool_buf = self._buf_pool[self._pool_idx % self._pool_size]
+                        self._pool_idx += 1
+                        quant.decode_into(block_data.payload, pool_buf)
+                        tensor = memoryview(pool_buf)[:decoded_len]
+                    else:
+                        fresh = bytearray(decoded_len)
+                        quant.decode_into(block_data.payload, fresh)
+                        tensor = memoryview(fresh)
                 else:
                     tensor = block_data.payload
 

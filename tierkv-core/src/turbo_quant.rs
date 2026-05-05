@@ -218,9 +218,9 @@ fn decode_grouped_into(
     }
     let n_groups = data.len() / stride;
     let expected_out = n_groups * group_size * 4;
-    if out_len != expected_out {
+    if out_len < expected_out {
         return Err(format!(
-            "output buffer length {} != expected {} ({} groups × {} floats × 4 bytes)",
+            "output buffer too small: {} < expected {} ({} groups × {} floats × 4 bytes)",
             out_len, expected_out, n_groups, group_size,
         ));
     }
