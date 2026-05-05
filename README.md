@@ -32,8 +32,11 @@ GPU cache hit is the primary vLLM value driver — ~26–40s saved per hit on lo
 
 ## How It Works
 
+tierkv supports two inference backends. The cold-storage layer (vault servers, gRPC, TurboQuant) is identical in both cases.
+
+**EXO backend** (monkey-patch):
 ```
-  DGX Spark — inference only
+  DGX GB10 — inference only
   ┌─────────────────────────────────┐
   │  EXO + Qwen3.6-35B-A3B (BF16)  │  ← EXO runs HERE only
   │  KVPrefixCache (GPU hot tier)   │
@@ -50,15 +53,37 @@ GPU cache hit is the primary vLLM value driver — ~26–40s saved per hit on lo
   (in-memory)      (in-memory)
 ```
 
+**vLLM backend** (KVConnectorBase_V1 plugin):
+```
+  DGX GB10 — inference only
+  ┌──────────────────────────────────────────┐
+  │  vLLM + Qwen3.6-35B-A3B                 │
+  │  Paged KV cache (GPU hot tier, 40 blocks)│
+  │         │ block evicted                  │
+  │         ▼                                │
+  │   TierKVConnector (KVConnectorBase_V1)   │
+  │   ├─ request_finished  → store to vault  │
+  │   ├─ get_num_new_matched_tokens → plan   │
+  │   └─ start_load_kv / wait_for_layer_load │
+  └────┬──────────────────┬──────────────────┘
+       │ full-attention KV │ SSM / linear-attn
+       │ (10 layers)       │ (30 layers)
+       ▼                   ▼
+  Mac Pro LAN          Mac Air WiFi    ← cold storage only, no vLLM
+  0.5ms RTT            6ms RTT
+  tierkv vault         tierkv vault
+  (in-memory)          (in-memory)
+```
+
 **Three tiers:**
 
-- **Hot** — EXO's GPU KVPrefixCache on the inference node. Fast, limited. Evicts at 60% RAM.
-- **Cold KV** — Full-attention layers (KVCache/RotatingKVCache) shipped to a LAN node via gRPC, compressed with TurboQuant INT8 (~3.9× ratio, ≥52 dB SNR).
-- **Cold SSM** — Linear-attention layers (ArraysCache) shipped to a second node. Qwen3.6-35B-A3B is a hybrid MoE — 10/40 layers use full attention, 30/40 use linear attention.
+- **Hot** — GPU KV cache on the inference node (EXO's `KVPrefixCache` or vLLM's paged KV cache). Fast, limited by GPU/HBM capacity.
+- **Cold KV** — Full-attention layer tensors shipped to a LAN node via gRPC, compressed with TurboQuant INT8 (~3.9× ratio, ≥52 dB SNR).
+- **Cold SSM** — Linear-attention / SSM layer states shipped to a second node. Qwen3.6-35B-A3B is a hybrid MoE — 10/40 layers use full attention, 30/40 use linear attention.
 
-On a cache miss, two parallel `BatchPromote` RPCs fetch all 40 layers in 2 network round-trips (down from 40 sequential RPCs before batch optimization).
+On a cache miss, two parallel `BatchPromote` RPCs fetch all blocks in 2 network round-trips, with parallel decode across a thread pool (decode releases the GIL, so N CPU cores work simultaneously).
 
-Layer types are **auto-detected** via `isinstance` checks — no manual layer index configuration needed.
+For vLLM, the `layer_type_map` in `tierkv.toml` routes each layer group to the correct vault. For EXO, layer types are **auto-detected** via `isinstance` checks — no manual configuration needed.
 
 ---
 
@@ -68,9 +93,9 @@ You need at least 2 machines: one running inference, one as cold storage. Three 
 
 | Role | What runs on it | Example |
 |---|---|---|
-| `inference` | EXO + your model + tierkv hook | DGX Spark |
-| `kv_cold` | `tierkv vault` only (no EXO) | Mac Pro (32 GB) |
-| `ssm_cold` | `tierkv vault` only (no EXO) | Mac Air (16 GB) |
+| `inference` | EXO **or vLLM** + your model + tierkv | DGX GB10 |
+| `kv_cold` | `tierkv vault` only | Mac Pro (32 GB) |
+| `ssm_cold` | `tierkv vault` only | Mac Air (16 GB) |
 
 **EXO only runs on the inference node.** The cold-tier machines (Mac Pro, Mac Air) only run the tierkv vault server — a lightweight gRPC process that holds KV data in RAM.
 
