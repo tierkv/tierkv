@@ -20,8 +20,9 @@ def connector():
     """Create TierKVConnector with mocked vLLM imports and vault clients."""
     # Mock vLLM imports
     mock_base = MagicMock()
-    mock_base.KVConnectorBase_V1 = object
-    mock_base.KVConnectorMetadata = object
+    mock_base.KVConnectorBase_V1 = type("KVConnectorBase_V1", (), {})
+    mock_base.KVConnectorMetadata = type("KVConnectorMetadata", (), {})
+    mock_base.SupportsHMA = type("SupportsHMA", (), {})
     mock_base.KVConnectorRole = MagicMock()
     mock_base.KVConnectorRole.SCHEDULER = 0
 
@@ -73,7 +74,9 @@ def connector():
             )
 
             self._restore_plans = {}
+            self._restore_block_ids = {}
             self._store_plans = {}
+            self._vllm_block_size = 16
             import concurrent.futures
             self._executor = concurrent.futures.ThreadPoolExecutor(
                 max_workers=2, thread_name_prefix="tierkv-test"
@@ -89,7 +92,7 @@ class TestGetNumNewMatchedTokens:
     def test_returns_none_when_no_cold_hits(self, connector):
         req = MockRequest(block_hashes=[b"\x01" * 32, b"\x02" * 32])
         result, is_async = connector.get_num_new_matched_tokens(req, 0)
-        assert result is None
+        assert result == 0  # 0 = no cold match, schedule normally
         assert is_async is False
 
     def test_returns_count_when_hits_exist(self, connector):
@@ -115,7 +118,7 @@ class TestGetNumNewMatchedTokens:
     def test_returns_none_when_no_block_hashes(self, connector):
         req = MockRequest(block_hashes=[])
         result, _ = connector.get_num_new_matched_tokens(req, 0)
-        assert result is None
+        assert result == 0  # 0 = no block hashes, schedule normally
 
 
 class TestRequestFinished:
