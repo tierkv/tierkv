@@ -144,7 +144,7 @@ class RequestHandler:
         if self.turbo_quant:
             from tierkv_core import TurboQuant
             quant = TurboQuant(self._group_size)
-            payload = quant.encode(tensor_bytes)
+            payload = bytes(quant.encode(tensor_bytes))
             is_quantized = True
         else:
             payload = tensor_bytes

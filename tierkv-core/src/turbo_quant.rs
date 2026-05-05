@@ -49,10 +49,14 @@ impl TurboQuant {
     /// Decode per-group INT8 compressed bytes → flat f32 bytes.
     /// Releases the GIL during computation so multiple calls from a Python
     /// thread pool can run concurrently (each takes ~1-2s CPU-bound).
-    pub fn decode_nogil(&self, py: Python<'_>, data: Vec<u8>) -> PyResult<Vec<u8>> {
+    pub fn decode_nogil(&self, py: Python<'_>, data: &[u8]) -> PyResult<Vec<u8>> {
         let dim = self.dim;
+        let (in_ptr, in_len) = (data.as_ptr() as usize, data.len());
         py.allow_threads(move || {
-            decode_grouped_inner(&data, dim)
+            let data_ref = unsafe {
+                std::slice::from_raw_parts(in_ptr as *const u8, in_len)
+            };
+            decode_grouped_inner(data_ref, dim)
                 .map(|floats| f32_to_bytes(&floats))
         })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
@@ -63,6 +67,9 @@ impl TurboQuant {
     /// Zero intermediate allocations — avoids the page-fault storm from
     /// three ~102 MB Vec allocations inside a large mmap'd vLLM process.
     ///
+    /// `data` is borrowed directly from the Python bytes/bytearray object
+    /// (zero-copy), so we only touch the raw pointer through allow_threads.
+    ///
     /// `out` must be exactly `decoded_size(len(data))` bytes; returns the
     /// number of bytes written.  Call `TurboQuant.decoded_size(compressed_len)`
     /// to size the buffer before calling.
@@ -71,23 +78,91 @@ impl TurboQuant {
     pub fn decode_into(
         &self,
         py: Python<'_>,
-        data: Vec<u8>,
+        data: &[u8],
         out: pyo3::Bound<'_, pyo3::types::PyByteArray>,
     ) -> PyResult<usize> {
         use pyo3::types::PyByteArrayMethods;
         let dim = self.dim;
-        // Grab the raw pointer + length while we hold the GIL, then cast to
-        // usize so the value is Send and can cross the allow_threads boundary.
-        // Safety: the bytearray must not be resized or shared across Python
-        // threads during this call — same contract as numpy's writable buffer.
+        // Grab raw pointers + lengths while we hold the GIL, then cast to
+        // usize so the values are Send and can cross the allow_threads boundary.
+        // Safety: neither buffer may be resized or freed while this call holds
+        // the caller's reference — same contract as numpy's writable buffer.
+        let (in_ptr, in_len) = (data.as_ptr() as usize, data.len());
         let (out_ptr_usize, out_len) = unsafe {
             let slice = out.as_bytes_mut();
             (slice.as_mut_ptr() as usize, slice.len())
         };
         py.allow_threads(move || {
-            decode_grouped_into(&data, dim, out_ptr_usize as *mut u8, out_len)
+            let data_ref = unsafe {
+                std::slice::from_raw_parts(in_ptr as *const u8, in_len)
+            };
+            decode_grouped_into(data_ref, dim, out_ptr_usize as *mut u8, out_len)
         })
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))
+    }
+
+    /// Returns the number of rayon worker threads in the global pool.
+    pub fn rayon_threads(&self) -> usize {
+        rayon::current_num_threads()
+    }
+
+    /// Rayon parallel benchmark: fills a 128MB buffer with decoded f32 values.
+    /// Returns elapsed milliseconds.  Used to verify parallelism.
+    pub fn rayon_bench(&self, py: Python<'_>) -> f64 {
+        use rayon::prelude::*;
+        use std::time::Instant;
+        let n: usize = 128 * 1024 * 1024 / 4; // 32M f32s
+        let num_threads = rayon::current_num_threads().max(1);
+        let min_len = (n + num_threads - 1) / num_threads;
+        py.allow_threads(move || {
+            let mut out = vec![0.0f32; n];
+            let t0 = Instant::now();
+            out.par_iter_mut()
+                .with_min_len(min_len)
+                .enumerate()
+                .for_each(|(i, x)| *x = i as f32);
+            t0.elapsed().as_secs_f64() * 1000.0
+        })
+    }
+
+    /// decode_into variant that allocates a fresh Vec internally.
+    /// Used to measure decode speed without the pre-warmed-buffer constraint.
+    /// Takes `data` as a borrowed slice (zero-copy, no page-fault on input).
+    pub fn decode_into_fresh(&self, py: Python<'_>, data: &[u8]) -> PyResult<usize> {
+        use rayon::prelude::*;
+        use std::time::Instant;
+        let dim = self.dim;
+        let stride = 4 + dim;
+        if data.len() % stride != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err("bad stride"));
+        }
+        let n_groups = data.len() / stride;
+        let bytes_per_group = dim * 4;
+        let total_out = n_groups * bytes_per_group;
+        let num_threads = rayon::current_num_threads().max(1);
+        let min_len = (n_groups + num_threads - 1) / num_threads;
+        let data_len = data.len();
+        let (in_ptr, in_len) = (data.as_ptr() as usize, data.len());
+        let elapsed = py.allow_threads(move || {
+            let data_ref = unsafe {
+                std::slice::from_raw_parts(in_ptr as *const u8, in_len)
+            };
+            let mut out = vec![0.0f32; n_groups * dim];
+            let t0 = Instant::now();
+            data_ref.par_chunks(stride)
+                .with_min_len(min_len)
+                .zip(out.par_chunks_mut(dim).with_min_len(min_len))
+                .for_each(|(in_chunk, out_f32)| {
+                    let scale = f32::from_le_bytes(in_chunk[0..4].try_into().unwrap());
+                    for (dst, &b) in out_f32.iter_mut().zip(in_chunk[4..].iter()) {
+                        *dst = (b as i8) as f32 * scale;
+                    }
+                });
+            t0.elapsed().as_secs_f64() * 1000.0
+        });
+        eprintln!("[tierkv-core] decode_into_fresh: {}ms for {}MB→{}MB",
+                  elapsed, data_len/1024/1024, total_out/1024/1024);
+        Ok(total_out)
     }
 
     /// Return the number of output bytes that `decode_into` will produce for
@@ -197,15 +272,20 @@ fn f32_to_bytes(floats: &[f32]) -> Vec<u8> {
 /// Zero-allocation in-place decode: writes decoded f32 LE bytes directly into
 /// `out_ptr[0..out_len]`.  Called from `decode_into` with the GIL released.
 ///
+/// Uses rayon to distribute groups across all available CPU cores.
+///
 /// # Safety
-/// Caller must ensure `out_ptr` points to a valid writable buffer of exactly
-/// `out_len` bytes, and that no other thread touches that buffer concurrently.
+/// Caller must ensure `out_ptr` points to a valid writable buffer of at least
+/// `n_groups * group_size * 4` bytes, and that no Python thread resizes the
+/// bytearray or holds references into it concurrently.
 fn decode_grouped_into(
     data: &[u8],
     group_size: usize,
     out_ptr: *mut u8,
     out_len: usize,
 ) -> Result<usize, String> {
+    use rayon::prelude::*;
+
     if data.len() < 4 {
         return Err("INT8 encoded data must be at least 4 bytes (scale header)".to_string());
     }
@@ -224,18 +304,38 @@ fn decode_grouped_into(
             out_len, expected_out, n_groups, group_size,
         ));
     }
-    // SAFETY: caller guarantees out_ptr is valid for out_len bytes.
+
+    // SAFETY: out_ptr is valid for out_len bytes; rayon gives each thread a
+    // disjoint, non-overlapping slice of `out`, so there are no data races.
     let out: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(out_ptr, out_len) };
-    let mut write_pos = 0usize;
-    for chunk in data.chunks_exact(stride) {
-        let scale = f32::from_le_bytes(chunk[0..4].try_into().unwrap());
-        for &b in &chunk[4..] {
-            let f: f32 = (b as i8) as f32 * scale;
-            out[write_pos..write_pos + 4].copy_from_slice(&f.to_le_bytes());
-            write_pos += 4;
-        }
-    }
-    Ok(write_pos)
+
+    let bytes_per_group = group_size * 4;
+
+    // Parallel decode: divide 106k groups across CPU cores as large contiguous
+    // batches to avoid rayon task-scheduling overhead.  With min_len=N, each
+    // rayon task processes N consecutive groups sequentially in one thread,
+    // giving cache-friendly sequential access and ~num_cpu speedup.
+    //
+    // bytemuck::cast_slice_mut reinterprets &mut [u8] as &mut [f32] so the
+    // compiler emits a vectorizable NEON store loop instead of to_le_bytes.
+    let num_threads = rayon::current_num_threads().max(1);
+    let min_len = (n_groups + num_threads - 1) / num_threads;
+
+    data.par_chunks(stride)
+        .with_min_len(min_len)
+        .zip(out.par_chunks_mut(bytes_per_group).with_min_len(min_len))
+        .for_each(|(in_chunk, out_chunk)| {
+            let scale = f32::from_le_bytes(in_chunk[0..4].try_into().unwrap());
+            // Safety: out_chunk is bytes_per_group = group_size * 4 bytes long,
+            // which is a multiple of 4; Python bytearray is ≥8-byte aligned,
+            // and chunks start at multiples of bytes_per_group (also ≥4 aligned).
+            let out_f32: &mut [f32] = bytemuck::cast_slice_mut(out_chunk);
+            for (dst, &b) in out_f32.iter_mut().zip(in_chunk[4..].iter()) {
+                *dst = (b as i8) as f32 * scale;
+            }
+        });
+
+    Ok(expected_out)
 }
 
 /// Pure-Rust version of decode_grouped — no GIL required, safe for allow_threads.

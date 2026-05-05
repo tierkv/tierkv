@@ -55,7 +55,7 @@ class VllmConnectorConfig:
             block_size=int(tierkv.get("block_size", cls.block_size)),
             turbo_quant=bool(tierkv.get("turbo_quant", cls.turbo_quant)),
             kv_dim=int(tierkv.get("kv_dim", inference.get("kv_dim", cls.kv_dim))),
-            layer_type_map=tierkv.get("layer_type_map", {}),
+            layer_type_map={int(k): v for k, v in tierkv.get("layer_type_map", {}).items()},
             max_inflight_stores=int(tierkv.get("max_inflight_stores", cls.max_inflight_stores)),
             max_inflight_promotes=int(tierkv.get("max_inflight_promotes", cls.max_inflight_promotes)),
         )

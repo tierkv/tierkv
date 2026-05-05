@@ -254,8 +254,11 @@ vllm serve Qwen/Qwen3.6-35B-A3B \
     "kv_connector_extra_config": {"config_path": "/path/to/tierkv.toml"}
   }' \
   --enable-prefix-caching \
-  --block-size 16
+  --block-size 16 \
+  --no-disable-hybrid-kv-cache-manager
 ```
+
+> **`--no-disable-hybrid-kv-cache-manager` is required** for hybrid models like Qwen3.5 MoE that mix full-attention and SSM/linear-attention layers. vLLM auto-disables HMA when a KV connector is set; this flag re-enables it. TierKVConnector implements `SupportsHMA` so the override is safe.
 
 Or pass config inline without a TOML file:
 

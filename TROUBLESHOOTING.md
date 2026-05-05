@@ -372,6 +372,34 @@ pydantic_core.ValidationError: Unsupported connector type: tierkv.connectors.vll
 
 ---
 
+### Testing eviction requires small KV cache + matching max-model-len
+
+**Problem:** With default `--gpu-memory-utilization 0.90` the KV cache holds 1000+ blocks. Two test requests will never trigger eviction.
+
+**Fix:** Use `--num-gpu-blocks-override N` to force a small block pool, and set `--max-model-len` to fit within that pool:
+
+```bash
+# 4 blocks × 1056 tokens/block (HMA) = 4224 token capacity
+VLLM_USE_FLASHINFER_MOE_FP16=0 vllm serve <model> \
+  --kv-transfer-config '...' \
+  --enable-prefix-caching \
+  --no-disable-hybrid-kv-cache-manager \
+  --num-gpu-blocks-override 4 \
+  --max-model-len 4096    # must fit in N blocks × block_size
+```
+
+**Why `--max-model-len` is required:** Without it, vLLM validates that the KV cache can hold at least one max-seq-len request (262144 tokens × layers × head bytes). 4 blocks = 0.08 GiB available; 262144 tokens = 5.14 GiB needed → startup fails.
+
+**Rule:** `max-model-len ≤ num-gpu-blocks-override × effective_block_size`. For Qwen3.6-35B-A3B with HMA, effective_block_size = 1056. So 4 blocks → max-model-len ≤ 4224.
+
+**Also required:** `--max-num-seqs N` where N ≤ num-gpu-blocks-override, to prevent:
+```
+ValueError: max_num_seqs (256) exceeds available Mamba cache blocks (8).
+```
+Each decode sequence needs one Mamba cache block. With 8 blocks, use `--max-num-seqs 8`.
+
+---
+
 ### kv_dim for vLLM connector
 
 The vLLM connector reads `kv_dim` from `tierkv.toml` (under `[tierkv]` or `[inference]`) or from `--kv-connector-extra-config`. Same rule applies as for the EXO hook — must match your model's attention head dimension. See [kv_dim table above](#kv_dim--the-silent-corruption-trap).

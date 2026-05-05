@@ -66,6 +66,12 @@ class BlockRegistry:
             rec = self._records.get(block_hash)
             return rec if rec and rec.status == "stored" else None
 
+    def is_pending(self, block_hash: bytes) -> bool:
+        """Returns True if the block is registered but still being stored."""
+        with self._lock:
+            rec = self._records.get(block_hash)
+            return rec is not None and rec.status == "pending"
+
     def lookup_by_vault_key(self, vault_key: str) -> Optional[BlockRecord]:
         with self._lock:
             block_hash = self._vault_index.get(vault_key)

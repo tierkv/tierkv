@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import logging
+import time
 from typing import Optional
+
+_log = logging.getLogger("tierkv.restore")
 
 from tierkv.connectors.vault_client import VllmVaultClient, VllmBlockData
 from tierkv.connectors.vllm.block_registry import BlockRegistry, BlockRecord
@@ -29,10 +33,13 @@ class RestoreHandler:
 
     # Maximum expected decoded block size.  Sized for a 1056-token HMA block
     # at float32 with the largest head configuration we've seen in production.
-    # Pre-allocating and pre-touching this buffer at init eliminates the page-fault
-    # storm that would otherwise occur on the first decode call inside vLLM's
-    # large mmap'd process (~84 GB on DGX GB10).
     _PREWARM_BYTES: int = 128 * 1024 * 1024  # 128 MiB
+
+    # Number of pre-warmed buffers.  One per possible block in a restore plan —
+    # with --num-gpu-blocks-override 40, at most 40 blocks are ever restored at
+    # once.  We never cycle (each block in the plan gets its own buffer), so
+    # memoryview slices returned to wait_for_layer_load are always valid.
+    _POOL_CAPACITY: int = 40
 
     def __init__(
         self,
@@ -64,10 +71,9 @@ class RestoreHandler:
         # decode_into accepts a buffer larger than the decoded output (writes to
         # the first decoded_len bytes, ignores the rest), so each pool buffer can
         # be reused across blocks of varying sizes.
-        self._pool_size = 8
         if self.turbo_quant:
             self._buf_pool: list[bytearray] = []
-            for _ in range(self._pool_size):
+            for _ in range(self._POOL_CAPACITY):
                 buf = bytearray(self._PREWARM_BYTES)
                 mv = memoryview(buf)
                 for offset in range(0, self._PREWARM_BYTES, 4096):
@@ -101,9 +107,47 @@ class RestoreHandler:
         matched_tokens = sum(r.num_tokens for r in load_plan)
         return matched_tokens, load_plan
 
+    def _decode_one(
+        self,
+        block_data: VllmBlockData,
+        record: BlockRecord,
+        pool_buf: Optional[bytearray],
+    ) -> tuple[bytes, tuple[object, int]]:
+        """
+        Decode a single block.  Runs in the thread pool so that multiple
+        decode_into calls (which release the GIL) execute concurrently.
+
+        Returns (block_hash, (tensor, num_tokens)).
+        Raises ValueError on tensor_hash mismatch.
+        """
+        # Tamper detection (cheap; SHA-256 also releases GIL in CPython 3.9+)
+        actual_hash = hashlib.sha256(block_data.payload).digest()
+        if record.tensor_hash and actual_hash != record.tensor_hash:
+            raise ValueError(
+                f"[tierkv] tensor hash mismatch: {block_data.block_hash_hex[:8]} "
+                f"— cold storage may be corrupted. Forcing re-prefill."
+            )
+
+        if block_data.is_quantized and self.turbo_quant:
+            from tierkv_core import TurboQuant
+            quant = TurboQuant(self._group_size)
+            decoded_len = quant.decoded_size(len(block_data.payload))
+            if pool_buf is not None:
+                quant.decode_into(block_data.payload, pool_buf)
+                tensor: object = memoryview(pool_buf)[:decoded_len]
+            else:
+                fresh = bytearray(decoded_len)
+                quant.decode_into(block_data.payload, fresh)
+                tensor = memoryview(fresh)
+        else:
+            tensor = block_data.payload
+
+        return record.block_hash, (tensor, record.num_tokens)
+
     def execute(self, load_plan: list[BlockRecord]) -> dict[bytes, tuple[bytes, int]]:
         """
-        Fires BatchPromote RPCs split by vault node.
+        Fires BatchPromote RPCs split by vault node, then decodes all blocks
+        in parallel using the thread pool (decode_into releases the GIL).
         Returns: block_hash -> (dequantized tensor bytes, num_tokens).
 
         num_tokens is the token count that was stored for this block (may be
@@ -136,7 +180,9 @@ class RestoreHandler:
                 [r.vault_key for r in ssm_records],
             )
 
-        results: dict[bytes, tuple[bytes, int]] = {}
+        # Collect (block_data, record) pairs as gRPC results arrive.
+        # Pool buffer assignment is single-threaded to avoid index races.
+        decode_futures: list[concurrent.futures.Future] = []
 
         for key, grpc_future in grpc_futures.items():
             blocks: list[VllmBlockData] = grpc_future.result()
@@ -146,39 +192,24 @@ class RestoreHandler:
                 if not block_data.payload:
                     continue
 
-                # Tamper detection
-                actual_hash = hashlib.sha256(block_data.payload).digest()
-                if record.tensor_hash and actual_hash != record.tensor_hash:
-                    raise ValueError(
-                        f"[tierkv] tensor hash mismatch: {block_data.block_hash_hex[:8]} "
-                        f"— cold storage may be corrupted. Forcing re-prefill."
-                    )
-
-                # Dequantize — decode_into writes directly into a pre-allocated
-                # bytearray, eliminating the 3 × ~102 MB intermediate
-                # allocations that cause a page-fault storm inside vLLM's
-                # large mmap'd process.  decode_into also releases the GIL.
-                if block_data.is_quantized and self.turbo_quant:
-                    from tierkv_core import TurboQuant
-                    quant = TurboQuant(self._group_size)
-                    decoded_len = quant.decoded_size(len(block_data.payload))
-                    # Pop a pre-warmed buffer from the pool — pages already
-                    # faulted in at init, zero page-fault overhead for the write.
-                    # decode_into accepts an oversized buffer (writes only the
-                    # first decoded_len bytes).  We return a memoryview slice so
-                    # np.frombuffer downstream gets a zero-copy view.
-                    if self._buf_pool and decoded_len <= self._PREWARM_BYTES:
-                        pool_buf = self._buf_pool[self._pool_idx % self._pool_size]
-                        self._pool_idx += 1
-                        quant.decode_into(block_data.payload, pool_buf)
-                        tensor = memoryview(pool_buf)[:decoded_len]
-                    else:
-                        fresh = bytearray(decoded_len)
-                        quant.decode_into(block_data.payload, fresh)
-                        tensor = memoryview(fresh)
+                # Assign a pre-warmed pool buffer (single-threaded).
+                if (block_data.is_quantized and self.turbo_quant
+                        and self._buf_pool
+                        and self._pool_idx < len(self._buf_pool)):
+                    pool_buf: Optional[bytearray] = self._buf_pool[self._pool_idx]
+                    self._pool_idx += 1
                 else:
-                    tensor = block_data.payload
+                    pool_buf = None
 
-                results[record.block_hash] = (tensor, record.num_tokens)
+                # Dispatch decode to thread pool — GIL is released inside
+                # decode_into, so N workers truly run in parallel.
+                decode_futures.append(
+                    self._executor.submit(self._decode_one, block_data, record, pool_buf)
+                )
+
+        results: dict[bytes, tuple[bytes, int]] = {}
+        for fut in concurrent.futures.as_completed(decode_futures):
+            block_hash, kv = fut.result()  # propagates ValueError on hash mismatch
+            results[block_hash] = kv
 
         return results

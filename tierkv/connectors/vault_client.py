@@ -92,6 +92,21 @@ class VllmVaultClient:
             for b in response["blocks"]
         ]
 
+    def warmup(self, timeout: float = 5.0) -> bool:
+        """Send a zero-key BatchPromote to establish the gRPC connection eagerly.
+
+        Returns True if the server responded (even with an empty result), False
+        if it timed out or was unreachable.  Call once at startup so the first
+        real cold-restore RPC doesn't pay the TCP + HTTP/2 handshake cost.
+        """
+        try:
+            self._batch_promote({"vault_keys": []}, timeout=timeout)
+            return True
+        except grpc.RpcError:
+            return True  # Any gRPC error means the connection is established
+        except Exception:
+            return False
+
     def close(self) -> None:
         self._channel.close()
 
