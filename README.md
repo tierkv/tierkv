@@ -410,26 +410,6 @@ All fields can be set in `tierkv.toml` under `[tierkv]` or passed via `--kv-conn
 > print(cfg.hidden_size // cfg.num_attention_heads)
 > ```
 
-### SDK hooks
-
-The connector exposes hooks for building proprietary audit or prioritization logic without forking tierkv:
-
-```python
-# Attach a callback fired after each successful block store:
-connector.register_store_callback(
-    lambda context_id, block_pos, vault_key: audit_log(context_id, vault_key)
-)
-
-# Tag a request so its blocks are tracked together:
-request.extra_metadata = {"tierkv_context_id": "session-abc"}
-
-# Query how many blocks are in cold storage for a session:
-count = connector.get_context_stored_count("session-abc")
-
-# Prioritize a context (0=normal, 1=high, 2=critical — higher = evicted last):
-connector.set_context_priority("session-abc", priority=2)
-```
-
 ---
 
 ## TurboQuant
