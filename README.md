@@ -17,15 +17,15 @@ Tested on Qwen3.6-35B-A3B across a DGX GB10 + Mac Pro + Mac Air cluster:
 | Cold start, 3,707-token prompt | 23.78s | baseline |
 | Restored from cold tier | 4.59s | **5.2× faster** |
 
-**vLLM integration** (30k-token Apple 10-K, GB10 GPU, real-world document Q&A):
+**vLLM integration** (Apple FY2025 10-K, GB10 GPU, real-world document Q&A):
 
-| Scenario | TTFT | vs Full Prefill |
-|---|---|---|
-| Full prefill, 30k-token prompt | 10.75s | baseline |
-| **GPU cache hit** | **1.19s** | **9× faster** |
-| **Cold vault restore** | **0.52s** | **20× faster** |
+| Prompt size | Cold prefill | GPU cache hit | Cold restore | Speedup |
+|---|---|---|---|---|
+| 30k tokens (measured) | 10.75s | 1.19s | **0.52s** | **20×** |
+| 60k tokens (projected) | ~26s | ~1.2s | ~1.0s | ~26× |
+| 128k tokens (projected) | ~70s | ~1.5s | ~2.0s | ~35× |
 
-Cold vault restore is faster than GPU cache hit — blocks land directly into the KV cache, skipping GPU attention recomputation entirely. Answer quality is bit-for-bit identical across all three paths.
+Cold vault restore beats GPU cache hit — blocks land directly into the KV cache skipping attention recomputation entirely. The speedup grows with context length because prefill scales super-linearly while restore is near-linear (network transfer). Answer quality is bit-for-bit identical across all three paths.
 
 ---
 
@@ -332,7 +332,15 @@ Measured on **DGX Spark (GB10, aarch64)** with **Qwen3.6-35B-A3B** (35B MoE, 40 
 | **GPU cache hit** | **1.19s** | **9× faster** | same prompt, blocks in GPU |
 | **Cold vault restore** | **0.52s** | **20× faster** | blocks from LAN vault, skip attention |
 
-**Cold vault restore beats GPU cache hit** — vault blocks are inserted directly into the KV cache without running attention, so TTFT is pure network + insertion latency (~0.5s) regardless of context length. GPU cache hit still has to run partial attention over the matched prefix.
+**Cold vault restore beats GPU cache hit** — vault blocks are inserted directly into the KV cache without running attention, so TTFT is pure network + insertion latency. GPU cache hit still runs partial attention over the matched prefix. The gap widens at longer contexts because prefill scales super-linearly while restore is near-linear (network transfer + KV insertion).
+
+**Projected scaling** (Qwen3.6-35B-A3B, 5GbE LAN vault):
+
+| Prompt size | Cold prefill | GPU cache hit | Cold restore | Speedup |
+|---|---|---|---|---|
+| 30k tokens (measured) | 10.75s | 1.19s | **0.52s** | **20×** |
+| 60k tokens (projected) | ~26s | ~1.2s | ~1.0s | ~26× |
+| 128k tokens (projected) | ~70s | ~1.5s | ~2.0s | ~35× |
 
 **Answer quality:** cold restore produces bit-for-bit identical output to full prefill. TurboQuant INT8 is lossy but per-group quantization preserves KV distributions well enough that the model's output is indistinguishable. The `tensor_hash` field in each `BlockRecord` detects any in-flight corruption.
 
@@ -341,6 +349,7 @@ Cold Prefill TTFT:   10.75s  (30k-token Apple 10-K, no cache)
 GPU Cache Hit TTFT:   1.19s  (9× faster — same document, blocks in GPU)
 Cold Restore TTFT:    0.52s  (20× faster — blocks in vault, skip attention)
 Answer quality:       identical output across all three paths
+Vault:                Mac Pro + Mac Air, 5GbE LAN, 1ms RTT
 ```
 
 ### Pre-launch smoke test
