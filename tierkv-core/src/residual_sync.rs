@@ -92,13 +92,28 @@ use tierkv::{
     cold_vault_service_server::{ColdVaultService, ColdVaultServiceServer},
     BatchPromoteResponse, StoreResponse,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{RwLock, Mutex};
 
-#[derive(Default)]
 pub struct ColdVaultServer {
     store: Arc<RwLock<HashMap<(u64, u32), KvTensor>>>,
+    /// Insertion-order queue: (key, payload_size_bytes). Oldest entry at front.
+    order: Arc<Mutex<VecDeque<((u64, u32), usize)>>>,
+    current_bytes: Arc<AtomicU64>,
+    max_bytes: u64,  // 0 = unlimited
+}
+
+impl ColdVaultServer {
+    pub fn new(max_bytes: u64) -> Self {
+        ColdVaultServer {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            order: Arc::new(Mutex::new(VecDeque::new())),
+            current_bytes: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -108,7 +123,27 @@ impl ColdVaultService for ColdVaultServer {
         req: tonic::Request<StoreRequest>,
     ) -> Result<tonic::Response<StoreResponse>, tonic::Status> {
         if let Some(kv) = req.into_inner().kv {
-            self.store.write().await.insert((kv.token_idx, kv.layer), kv);
+            let size = kv.data.len();
+            let key = (kv.token_idx, kv.layer);
+            self.store.write().await.insert(key, kv);
+            let mut order = self.order.lock().await;
+            order.push_back((key, size));
+            let new_total = self.current_bytes.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+            // Evict oldest entries if over capacity
+            if self.max_bytes > 0 && new_total > self.max_bytes {
+                let mut store = self.store.write().await;
+                while self.current_bytes.load(Ordering::Relaxed) > self.max_bytes {
+                    match order.pop_front() {
+                        None => break,
+                        Some((old_key, old_size)) => {
+                            // Block may have been promoted (destructive) already — only subtract if present
+                            if store.remove(&old_key).is_some() {
+                                self.current_bytes.fetch_sub(old_size as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
             Ok(tonic::Response::new(StoreResponse { ok: true }))
         } else {
             Err(tonic::Status::invalid_argument("missing kv tensor"))
@@ -122,7 +157,10 @@ impl ColdVaultService for ColdVaultServer {
         let r = req.into_inner();
         let mut guard = self.store.write().await;
         match guard.remove(&(r.token_idx, r.layer)) {
-            Some(kv) => Ok(tonic::Response::new(kv)),
+            Some(kv) => {
+                self.current_bytes.fetch_sub(kv.data.len() as u64, Ordering::Relaxed);
+                Ok(tonic::Response::new(kv))
+            }
             None => Err(tonic::Status::not_found("token not in cold vault")),
         }
     }
@@ -134,21 +172,27 @@ impl ColdVaultService for ColdVaultServer {
         let r = req.into_inner();
         let mut guard = self.store.write().await;
         let tensors = r.layers.iter().map(|&layer| {
-            guard.remove(&(r.token_idx, layer)).unwrap_or_else(|| KvTensor {
-                token_idx: r.token_idx,
-                layer,
-                data: vec![],
-                rows: 0,
-                cols: 0,
-                dtype: "f32".into(),
-            })
+            match guard.remove(&(r.token_idx, layer)) {
+                Some(kv) => {
+                    self.current_bytes.fetch_sub(kv.data.len() as u64, Ordering::Relaxed);
+                    kv
+                }
+                None => KvTensor {
+                    token_idx: r.token_idx,
+                    layer,
+                    data: vec![],
+                    rows: 0,
+                    cols: 0,
+                    dtype: "f32".into(),
+                }
+            }
         }).collect();
         Ok(tonic::Response::new(BatchPromoteResponse { tensors }))
     }
 }
 
-pub fn cold_vault_server() -> ColdVaultServiceServer<ColdVaultServer> {
-    ColdVaultServiceServer::new(ColdVaultServer::default())
+pub fn cold_vault_server(max_bytes: u64) -> ColdVaultServiceServer<ColdVaultServer> {
+    ColdVaultServiceServer::new(ColdVaultServer::new(max_bytes))
         .max_encoding_message_size(512 * 1024 * 1024) // 512 MiB — batch responses can be >4 MB
         .max_decoding_message_size(512 * 1024 * 1024) // 512 MiB — INT8 Store requests can be >4 MB
 }
@@ -236,10 +280,26 @@ use tierkv::{
 };
 
 /// In-memory vLLM block store. Key = vault_key (string), Value = (block_hash_hex, payload, is_quantized).
-#[derive(Default)]
+/// Evicts oldest blocks (insertion order) when max_bytes is exceeded.
 pub struct VllmColdVaultServer {
     store: Arc<RwLock<HashMap<String, (String, Vec<u8>, bool)>>>,
-    counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Insertion-order queue: (vault_key, payload_size_bytes). Oldest entry at front.
+    order: Arc<Mutex<VecDeque<(String, usize)>>>,
+    current_bytes: Arc<AtomicU64>,
+    max_bytes: u64,  // 0 = unlimited
+    counter: Arc<AtomicU64>,
+}
+
+impl VllmColdVaultServer {
+    pub fn new(max_bytes: u64) -> Self {
+        VllmColdVaultServer {
+            store: Arc::new(RwLock::new(HashMap::new())),
+            order: Arc::new(Mutex::new(VecDeque::new())),
+            current_bytes: Arc::new(AtomicU64::new(0)),
+            max_bytes,
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -249,12 +309,30 @@ impl VllmColdVaultService for VllmColdVaultServer {
         req: tonic::Request<VllmBlockStoreRequest>,
     ) -> Result<tonic::Response<VllmBlockStoreResponse>, tonic::Status> {
         let r = req.into_inner();
-        let seq = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let seq = self.counter.fetch_add(1, Ordering::Relaxed);
         let vault_key = format!("vk-{}-{}", r.block_hash_hex, seq);
+        let size = r.payload.len();
         self.store.write().await.insert(
             vault_key.clone(),
             (r.block_hash_hex, r.payload, r.is_quantized),
         );
+        let mut order = self.order.lock().await;
+        order.push_back((vault_key.clone(), size));
+        let new_total = self.current_bytes.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+        // Evict oldest entries if over capacity
+        if self.max_bytes > 0 && new_total > self.max_bytes {
+            let mut store = self.store.write().await;
+            while self.current_bytes.load(Ordering::Relaxed) > self.max_bytes {
+                match order.pop_front() {
+                    None => break,
+                    Some((old_key, old_size)) => {
+                        if store.remove(&old_key).is_some() {
+                            self.current_bytes.fetch_sub(old_size as u64, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
         Ok(tonic::Response::new(VllmBlockStoreResponse { vault_key }))
     }
 
@@ -282,11 +360,8 @@ impl VllmColdVaultService for VllmColdVaultServer {
     }
 }
 
-pub fn vllm_cold_vault_server() -> VllmColdVaultServiceServer<VllmColdVaultServer> {
-    VllmColdVaultServiceServer::new(VllmColdVaultServer {
-        store: Arc::new(RwLock::new(HashMap::new())),
-        counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-    })
-    .max_encoding_message_size(512 * 1024 * 1024)
-    .max_decoding_message_size(512 * 1024 * 1024)
+pub fn vllm_cold_vault_server(max_bytes: u64) -> VllmColdVaultServiceServer<VllmColdVaultServer> {
+    VllmColdVaultServiceServer::new(VllmColdVaultServer::new(max_bytes))
+        .max_encoding_message_size(512 * 1024 * 1024)
+        .max_decoding_message_size(512 * 1024 * 1024)
 }

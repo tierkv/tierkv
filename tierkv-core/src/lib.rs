@@ -16,8 +16,11 @@ pub mod residual_sync;
 /// Start the ColdVault gRPC server in a background thread (non-blocking).
 /// Serves both EXO (ColdVaultService) and vLLM (VllmColdVaultService) on the same port.
 /// Call once at process startup on a cold-tier node.
+///
+/// max_bytes: evict oldest blocks when vault exceeds this size. 0 = unlimited.
 #[pyfunction]
-fn start_cold_vault_server(port: u16) -> PyResult<()> {
+#[pyo3(signature = (port, max_bytes=0))]
+fn start_cold_vault_server(port: u16, max_bytes: u64) -> PyResult<()> {
     std::thread::spawn(move || {
         let rt = Runtime::new().expect("tokio runtime");
         rt.block_on(async move {
@@ -25,8 +28,8 @@ fn start_cold_vault_server(port: u16) -> PyResult<()> {
             use tonic::transport::Server;
             let addr = format!("0.0.0.0:{port}").parse().expect("addr");
             Server::builder()
-                .add_service(cold_vault_server())
-                .add_service(vllm_cold_vault_server())
+                .add_service(cold_vault_server(max_bytes))
+                .add_service(vllm_cold_vault_server(max_bytes))
                 .serve(addr)
                 .await
                 .expect("ColdVault server error");

@@ -53,5 +53,13 @@ kv_dim = 256
 # Port for the ColdVault gRPC server on this node
 port = 50051
 
+# LRU eviction: evict oldest blocks when vault RAM exceeds this limit.
+# Set to leave ~4 GB headroom for the OS and other processes.
+# 0 = unlimited (default — vault grows until OOM).
+#
+# Mac Air (16 GB):  max_bytes = 12000000000
+# Mac Pro (32 GB):  max_bytes = 28000000000
+# max_bytes = 12000000000
+
 # Optional: persist KV cache to disk across reboots (leave unset for in-memory only)
 # persist_path = "/var/lib/tierkv/cold_vault.db"

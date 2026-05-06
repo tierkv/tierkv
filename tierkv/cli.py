@@ -21,8 +21,11 @@ def cmd_vault(args):
     port = args.port or cfg.vault.port
 
     from tierkv_core import start_cold_vault_server
-    start_cold_vault_server(port)
+    max_bytes = cfg.vault.max_bytes
+    start_cold_vault_server(port, max_bytes)
     time.sleep(0.5)
+    if max_bytes > 0:
+        print(f"[tierkv vault] LRU eviction enabled — max {max_bytes / 1e9:.1f} GB")
 
     try:
         s = socket.create_connection(("127.0.0.1", port), timeout=2)

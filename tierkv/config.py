@@ -12,6 +12,7 @@ See tierkv.toml.example for all available options.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 try:
     import tomllib  # stdlib Python 3.11+
@@ -52,6 +53,7 @@ class InferenceConfig:
 class VaultConfig:
     port: int = 50051
     persist_path: str = ""
+    max_bytes: int = 0  # 0 = unlimited; e.g. 12_000_000_000 for Mac Air (16 GB)
 
 
 @dataclass
@@ -86,11 +88,12 @@ def _parse(data: dict) -> TierkvConfig:
     vault = data.get("vault", {})
     cfg.vault.port = int(vault.get("port", cfg.vault.port))
     cfg.vault.persist_path = vault.get("persist_path", cfg.vault.persist_path)
+    cfg.vault.max_bytes = int(vault.get("max_bytes", cfg.vault.max_bytes))
 
     return cfg
 
 
-def load_config(path: str | None = None) -> TierkvConfig:
+def load_config(path: Optional[str] = None) -> TierkvConfig:
     """
     Load tierkv configuration from a TOML file.
 
