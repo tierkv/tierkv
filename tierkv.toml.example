@@ -63,3 +63,9 @@ port = 50051
 
 # Optional: persist KV cache to disk across reboots (leave unset for in-memory only)
 # persist_path = "/var/lib/tierkv/cold_vault.db"
+
+[tierkv]
+# Optional: path to SQLite db that persists the block_hash → vault_key registry
+# across vLLM restarts. Without this, vault blocks become unreachable on restart.
+# Uncomment and set to a stable path (directory must exist):
+# registry_db_path = "/home/user/.local/share/tierkv/registry.db"

@@ -29,7 +29,7 @@ exo = [
     "openai>=2.33.0",
 ]
 vllm = [
-    "vllm>=0.8",
+    "vllm>=0.20.1",
 ]
 all = [
     "tierkv[exo]",

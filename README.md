@@ -349,14 +349,14 @@ A speedup below **1.5×** means the cold tier isn't being hit — check `tierkv 
 
 tierkv ships a native **vLLM KV Connector** that plugs into vLLM's `KVConnectorBase_V1` API. It uses the same cold vault infrastructure as the EXO hook — the same `tierkv_core` Rust backend, the same `tierkv.toml` config, and the same gRPC vault servers on Mac Pro / Mac Air.
 
-**Tested with:** vLLM 0.20.1, torch 2.11.0+cu130, CUDA 13.0 on DGX GB10 (aarch64).
+**Tested with:** vLLM 0.20.1, torch 2.11.0+cu130, CUDA 13.0 on DGX GB10 (aarch64). **Requires vLLM ≥ 0.20.1** — earlier versions have an incompatible `KVConnectorBase_V1` API. A runtime warning is emitted if an older version is detected.
 
 ### Install vLLM
 
 ```bash
 # Linux aarch64 (DGX GB10/Spark) — requires Python dev headers for fastsafetensors
 sudo apt-get install -y python3.12-dev
-pip install vllm tierkv
+pip install "vllm>=0.20.1" tierkv
 ```
 
 > **Important:** If vLLM runs in its own virtualenv (common with `pip install vllm`), install `tierkv` **inside that same venv** — not just in the system Python. The connector is imported by the vLLM process at runtime.
@@ -410,7 +410,8 @@ vllm serve Qwen/Qwen3.6-35B-A3B \
       "ssm_cold_port": 50051,
       "kv_dim": 256,
       "turbo_quant": true,
-      "block_size": 16
+      "block_size": 16,
+      "registry_db_path": "/home/user/.local/share/tierkv/registry.db"
     }
   }' \
   --enable-prefix-caching \
@@ -506,6 +507,7 @@ All fields can be set in `tierkv.toml` under `[tierkv]` or passed via `--kv-conn
 | `turbo_quant` | `true` | INT8 compression (~3.9× ratio) |
 | `max_inflight_stores` | `8` | Concurrent eviction-to-vault gRPC calls |
 | `max_inflight_promotes` | `4` | Concurrent restore-from-vault threads |
+| `registry_db_path` | `None` | Path to SQLite registry db (e.g. `~/.local/share/tierkv/registry.db`). When set, the block_hash→vault_key mapping persists across vLLM restarts so vault blocks remain accessible. When unset, the registry is in-memory only — vault blocks become unreachable on restart. |
 
 > **kv_dim is critical.** Wrong value causes silent incorrect compression. Find the right value with:
 > ```python

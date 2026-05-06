@@ -11,10 +11,15 @@ Launch:
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 import math
 import threading
 from dataclasses import dataclass, field
 from typing import Optional
+
+_log = logging.getLogger("tierkv.connector")
+
+_TESTED_VLLM = "0.20.1"
 
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -23,6 +28,18 @@ try:
         KVConnectorRole,
         SupportsHMA,
     )
+    import warnings as _warnings
+    import vllm as _vllm_mod
+    _vllm_ver = getattr(_vllm_mod, "__version__", "0.0.0")
+    if _vllm_ver < _TESTED_VLLM:
+        _warnings.warn(
+            f"[tierkv] vLLM {_vllm_ver} is older than the tested version "
+            f"{_TESTED_VLLM}. KVConnectorBase_V1 / SupportsHMA API may differ. "
+            f"Upgrade: pip install 'vllm>={_TESTED_VLLM}'",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    del _warnings, _vllm_mod, _vllm_ver
 except ImportError:
     # Allow import without vLLM installed (testing, EXO-only installs)
     KVConnectorBase_V1 = object
@@ -92,6 +109,16 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
             and hasattr(vllm_config.kv_transfer_config, "engine_id")
             else "default"
         )
+        if self.cfg.registry_db_path and engine_id not in TierKVConnector._shared_registries:
+            from tierkv.connectors.vllm.registry_persistence import PersistentBlockRegistry
+            _is_worker = (
+                KVConnectorRole is not None
+                and role == KVConnectorRole.WORKER
+            )
+            TierKVConnector._shared_registries[engine_id] = PersistentBlockRegistry(
+                self.cfg.registry_db_path,
+                readonly=_is_worker,
+            )
         self.registry = TierKVConnector._shared_registries.setdefault(
             engine_id, BlockRegistry()
         )
@@ -270,6 +297,14 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         """
         block_hashes = getattr(request, "block_hashes", None)
         if not block_hashes:
+            num_tokens = getattr(request, "num_tokens", 0)
+            if num_tokens > 0:
+                _log.warning(
+                    "[tierkv] request_finished: 0 block hashes for %d-token request. "
+                    "Prompt is shorter than one full block (%d tokens for this model). "
+                    "Vault store skipped — prompts must exceed the HMA block size to be eligible.",
+                    num_tokens, self._vllm_block_size,
+                )
             return False, None
 
         if not self.request_handler.should_store(block_hashes):

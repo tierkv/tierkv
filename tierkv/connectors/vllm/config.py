@@ -34,6 +34,11 @@ class VllmConnectorConfig:
     max_inflight_stores: int = 8
     max_inflight_promotes: int = 4
 
+    # Persistence: path to SQLite registry db. None = in-memory only (default).
+    # Set to a stable path (e.g. /var/lib/tierkv/registry.db) so the
+    # block_hash → vault_key mapping survives vLLM restarts.
+    registry_db_path: Optional[str] = None
+
     @classmethod
     def from_toml(cls, path: str) -> VllmConnectorConfig:
         with open(path, "rb") as f:
@@ -58,6 +63,7 @@ class VllmConnectorConfig:
             layer_type_map={int(k): v for k, v in tierkv.get("layer_type_map", {}).items()},
             max_inflight_stores=int(tierkv.get("max_inflight_stores", cls.max_inflight_stores)),
             max_inflight_promotes=int(tierkv.get("max_inflight_promotes", cls.max_inflight_promotes)),
+            registry_db_path=tierkv.get("registry_db_path") or None,
         )
 
     @classmethod
