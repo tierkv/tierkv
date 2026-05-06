@@ -128,7 +128,14 @@ Prebuilt wheels are available for:
 
 ## Setup — Step by Step
 
-tierkv runs on **all three machines**, but each machine has a different role and a different config. Install tierkv on every node first, then configure each one.
+tierkv runs on **all three machines**, but each machine has a different role and a different config. Install `tierkv` on **every node** first — including the cold vault nodes (Mac Pro, Mac Air). The vault server is part of the `tierkv` Python package, not just `tierkv-core`.
+
+```bash
+# Run this on DGX, Mac Pro, and Mac Air
+pip install tierkv
+```
+
+Then configure each machine.
 
 ### Step 1 — Configure each machine
 
@@ -187,15 +194,23 @@ port = 50051
 
 ### Step 2 — Start vault servers on cold nodes
 
-> **Warning — unbounded RAM growth:** The vault holds all received KV data in RAM and currently has no eviction policy. On a Mac Air (16 GB) running a long session, vault RAM will grow until the process is killed. Monitor with `tierkv status` and restart vault servers between sessions if needed. LRU eviction is on the [roadmap](#roadmap).
-
 On **Mac Pro** and **Mac Air** (not on DGX):
 
 ```bash
-tierkv vault
+tierkv --config /path/to/tierkv.toml vault
 ```
 
+> **Note:** `--config` is a global flag and must come **before** the subcommand. `tierkv vault --config path` will fail with "unrecognized arguments".
+
 This starts the ColdVault gRPC server that the inference node will send KV data to. Keep it running as a background service (macOS launchd / Linux systemd).
+
+To flush all cached blocks (useful when debugging or switching models):
+
+```bash
+tierkv --config /path/to/tierkv.toml flush
+tierkv --config /path/to/tierkv.toml flush --target kv_cold   # Mac Pro only
+tierkv --config /path/to/tierkv.toml flush --target ssm_cold  # Mac Air only
+```
 
 ### Step 3 — Install the EXO hook on the inference node
 
@@ -268,6 +283,13 @@ tierkv ships a native **vLLM KV Connector** that plugs into vLLM's `KVConnectorB
 sudo apt-get install -y python3.12-dev
 pip install vllm tierkv
 ```
+
+> **Important:** If vLLM runs in its own virtualenv (common with `pip install vllm`), install `tierkv` **inside that same venv** — not just in the system Python. The connector is imported by the vLLM process at runtime.
+>
+> ```bash
+> # Example: vLLM installed in /home/user/vllm-venv
+> /home/user/vllm-venv/bin/pip install tierkv
+> ```
 
 ```bash
 # Linux x86_64 / macOS arm64

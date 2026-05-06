@@ -329,29 +329,71 @@ def cmd_bench(args):
     print(f"  Time saved per request:   {t1 - t3:.2f}s")
 
 
+def _add_config_arg(p):
+    p.add_argument("--config", metavar="PATH", help="Path to tierkv.toml")
+
+
+def cmd_flush(args):
+    """Flush all blocks from vault servers."""
+    from tierkv.config import load_config
+    from tierkv.connectors.vault_client import VllmVaultClient
+    cfg = load_config(args.config)
+
+    targets = []
+    if args.target in ("kv_cold", "all"):
+        targets.append(("kv_cold", cfg.cluster.kv_cold.host, cfg.cluster.kv_cold.port))
+    if args.target in ("ssm_cold", "all"):
+        targets.append(("ssm_cold", cfg.cluster.ssm_cold.host, cfg.cluster.ssm_cold.port))
+
+    any_fail = False
+    for name, host, port in targets:
+        try:
+            client = VllmVaultClient(host, port)
+            freed = client.flush_sync()
+            client.close()
+            print(f"[tierkv flush] {name} ({host}:{port}) — flushed {freed / 1e6:.1f} MB")
+        except Exception as e:
+            print(f"[tierkv flush] {name} ({host}:{port}) — FAILED: {e}", file=sys.stderr)
+            any_fail = True
+
+    if any_fail:
+        sys.exit(1)
+    print("[tierkv flush] Done.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="tierkv",
         description="tierkv — 3-tier distributed KV cache for LLM inference",
     )
-    parser.add_argument("--config", metavar="PATH", help="Path to tierkv.toml")
+    _add_config_arg(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
     # vault
     p_vault = sub.add_parser("vault", help="Start ColdVault gRPC server on this node")
     p_vault.add_argument("--port", type=int, help="Port to listen on (default: from config or 50051)")
+    _add_config_arg(p_vault)
 
     # install
     p_install = sub.add_parser("install", help="Install tierkv hook into an EXO installation")
     p_install.add_argument("--exo-path", metavar="PATH", help="Path to EXO src/exo directory")
+    _add_config_arg(p_install)
 
     # status
-    sub.add_parser("status", help="Check reachability of all cluster nodes")
+    p_status = sub.add_parser("status", help="Check reachability of all cluster nodes")
+    _add_config_arg(p_status)
 
     # bench
     p_bench = sub.add_parser("bench", help="Run cold→restore TTFT benchmark")
     p_bench.add_argument("--exo-api", metavar="URL", help="EXO API base URL (default: http://127.0.0.1:52415)")
     p_bench.add_argument("--model", metavar="MODEL_ID", help="Model ID to use (default: Qwen/Qwen3.6-35B-A3B)")
+    _add_config_arg(p_bench)
+
+    # flush
+    p_flush = sub.add_parser("flush", help="Flush all blocks from vault servers (clears cold storage)")
+    p_flush.add_argument("--target", choices=["kv_cold", "ssm_cold", "all"], default="all",
+                         help="Which vault to flush (default: all)")
+    _add_config_arg(p_flush)
 
     args = parser.parse_args()
 
@@ -360,6 +402,7 @@ def main():
         "install": cmd_install,
         "status":  cmd_status,
         "bench":   cmd_bench,
+        "flush":   cmd_flush,
     }
     dispatch[args.command](args)
 

@@ -90,7 +90,7 @@ impl RecomputeClient {
 
 use tierkv::{
     cold_vault_service_server::{ColdVaultService, ColdVaultServiceServer},
-    BatchPromoteResponse, StoreResponse,
+    BatchPromoteResponse, FlushRequest, FlushResponse, StoreResponse,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -188,6 +188,17 @@ impl ColdVaultService for ColdVaultServer {
             }
         }).collect();
         Ok(tonic::Response::new(BatchPromoteResponse { tensors }))
+    }
+
+    async fn flush(
+        &self,
+        _req: tonic::Request<FlushRequest>,
+    ) -> Result<tonic::Response<FlushResponse>, tonic::Status> {
+        let flushed = self.current_bytes.load(Ordering::Relaxed);
+        self.store.write().await.clear();
+        self.order.lock().await.clear();
+        self.current_bytes.store(0, Ordering::Relaxed);
+        Ok(tonic::Response::new(FlushResponse { flushed_bytes: flushed }))
     }
 }
 
@@ -357,6 +368,17 @@ impl VllmColdVaultService for VllmColdVaultServer {
             }
         }).collect();
         Ok(tonic::Response::new(VllmBatchPromoteResponse { blocks }))
+    }
+
+    async fn flush(
+        &self,
+        _req: tonic::Request<FlushRequest>,
+    ) -> Result<tonic::Response<FlushResponse>, tonic::Status> {
+        let flushed = self.current_bytes.load(Ordering::Relaxed);
+        self.store.write().await.clear();
+        self.order.lock().await.clear();
+        self.current_bytes.store(0, Ordering::Relaxed);
+        Ok(tonic::Response::new(FlushResponse { flushed_bytes: flushed }))
     }
 }
 

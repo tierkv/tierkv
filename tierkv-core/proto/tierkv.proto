@@ -27,10 +27,14 @@ message BatchPromoteResponse {
   repeated KVTensor tensors = 1;  // same order as request.layers; empty data = missing
 }
 
+message FlushRequest  {}
+message FlushResponse { uint64 flushed_bytes = 1; }
+
 service ColdVaultService {
   rpc Store        (StoreRequest)        returns (StoreResponse);
   rpc Promote      (PromoteRequest)      returns (KVTensor);
   rpc BatchPromote (BatchPromoteRequest) returns (BatchPromoteResponse);
+  rpc Flush        (FlushRequest)        returns (FlushResponse);
 }
 
 // ── Recompute (inference node) ───────────────────────────────────────────────
@@ -75,4 +79,5 @@ message VllmBlockData {
 service VllmColdVaultService {
   rpc StoreBlock   (VllmBlockStoreRequest)   returns (VllmBlockStoreResponse);
   rpc BatchPromote (VllmBatchPromoteRequest)  returns (VllmBatchPromoteResponse);
+  rpc Flush        (FlushRequest)             returns (FlushResponse);
 }

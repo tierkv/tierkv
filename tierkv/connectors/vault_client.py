@@ -59,6 +59,11 @@ class VllmVaultClient:
             request_serializer=_serialize_batch_promote_request,
             response_deserializer=_deserialize_batch_promote_response,
         )
+        self._flush = self._channel.unary_unary(
+            "/tierkv.VllmColdVaultService/Flush",
+            request_serializer=lambda _: b"",
+            response_deserializer=_deserialize_flush_response,
+        )
 
     def store_block_sync(
         self,
@@ -106,6 +111,11 @@ class VllmVaultClient:
             return True  # Any gRPC error means the connection is established
         except Exception:
             return False
+
+    def flush_sync(self, timeout: float = 10.0) -> int:
+        """Flush all blocks from the vault. Returns bytes freed."""
+        response = self._flush(b"", timeout=timeout)
+        return response.get("flushed_bytes", 0)
 
     def close(self) -> None:
         self._channel.close()
@@ -243,3 +253,12 @@ def _deserialize_batch_promote_response(data: bytes) -> dict:
         if field_num == 1 and wire_type == 2:
             blocks.append(_deserialize_block_data(value))
     return {"blocks": blocks}
+
+
+def _deserialize_flush_response(data: bytes) -> dict:
+    """Deserialize FlushResponse { uint64 flushed_bytes = 1; }"""
+    flushed_bytes = 0
+    for field_num, wire_type, value in _decode_fields(data):
+        if field_num == 1 and wire_type == 0:  # varint
+            flushed_bytes = value
+    return {"flushed_bytes": flushed_bytes}

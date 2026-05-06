@@ -58,11 +58,50 @@ fn start_recompute_server(port: u16) -> PyResult<()> {
     Ok(())
 }
 
+/// Flush all blocks from a remote ColdVaultService (EXO tier) or VllmColdVaultService.
+/// Connects to host:port, calls Flush on both services, returns total bytes freed.
+/// Raises RuntimeError on connection or RPC failure.
+#[pyfunction]
+fn flush_cold_vault(host: &str, port: u16) -> PyResult<u64> {
+    let addr = format!("{}:{}", host, port);
+    let rt = Runtime::new().map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+    rt.block_on(async move {
+        use residual_sync::tierkv::{
+            cold_vault_service_client::ColdVaultServiceClient,
+            vllm_cold_vault_service_client::VllmColdVaultServiceClient,
+            FlushRequest,
+        };
+        let url = format!("http://{addr}");
+        let mut total = 0u64;
+
+        match ColdVaultServiceClient::connect(url.clone()).await {
+            Ok(mut c) => {
+                if let Ok(r) = c.flush(tonic::Request::new(FlushRequest {})).await {
+                    total += r.into_inner().flushed_bytes;
+                }
+            }
+            Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                format!("connect failed: {e}")
+            )),
+        }
+        match VllmColdVaultServiceClient::connect(url).await {
+            Ok(mut c) => {
+                if let Ok(r) = c.flush(tonic::Request::new(FlushRequest {})).await {
+                    total += r.into_inner().flushed_bytes;
+                }
+            }
+            Err(_) => {} // vLLM vault may not be on this node; not fatal
+        }
+        Ok(total)
+    })
+}
+
 #[pymodule]
 fn tierkv_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<turbo_quant::TurboQuant>()?;
     m.add_class::<tiered_kv::TieredKVCache>()?;
     m.add_function(wrap_pyfunction!(start_cold_vault_server, m)?)?;
     m.add_function(wrap_pyfunction!(start_recompute_server, m)?)?;
+    m.add_function(wrap_pyfunction!(flush_cold_vault, m)?)?;
     Ok(())
 }
