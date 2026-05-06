@@ -139,24 +139,26 @@ Then configure each machine.
 
 ### Step 1 — Configure each machine
 
-Each machine gets its own `tierkv.toml` with its role and the addresses of the other nodes. Copy the example and edit it:
+Each machine gets its own `tierkv.toml`. The recommended location is `~/.config/tierkv/tierkv.toml` (created automatically by `tierkv install`) or anywhere you prefer — just pass `--config /path/to/tierkv.toml` to every command. You can also set `TIERKV_CONFIG=/path/to/tierkv.toml` in your shell profile to avoid passing it every time.
 
 ```bash
-cp tierkv.toml.example tierkv.toml
+mkdir -p ~/.config/tierkv
+cp tierkv.toml.example ~/.config/tierkv/tierkv.toml
+# edit the file with your IPs and paths
 ```
 
-**On the inference node (DGX Spark)** — set `role = "inference"` and point to the cold nodes:
+**On the inference node (DGX / Linux GPU server)** — set `role = "inference"` and point to the cold nodes:
 
 ```toml
 [cluster]
 role = "inference"
 
 [cluster.kv_cold]
-host = "192.168.50.11"      # Mac Pro LAN IP
+host = "192.168.50.11"      # cold node 1 IP (LAN)
 port = 50051
 
 [cluster.ssm_cold]
-host = "192.168.50.12"      # Mac Air LAN IP (5GbE)
+host = "192.168.50.12"      # cold node 2 IP (LAN)
 port = 50051
 
 [cluster.recompute]
@@ -164,13 +166,13 @@ host = "127.0.0.1"
 port = 50052
 
 [inference]
-exo_path = "/home/user/exo/src/exo"   # path to your EXO installation
+exo_path = "/home/user/exo/src/exo"   # path to your EXO installation (EXO backend only)
 log_file  = "/tmp/tierkv.log"
 memory_threshold = 0.60
 kv_dim   = 256
 ```
 
-**On the KV cold node (Mac Pro)** — set `role = "kv_cold"`, addresses don't matter here:
+**On the KV cold node (cold machine 1)** — set `role = "kv_cold"` and set `max_bytes` to ~75% of available RAM:
 
 ```toml
 [cluster]
@@ -178,9 +180,10 @@ role = "kv_cold"
 
 [vault]
 port = 50051
+max_bytes = 24_000_000_000   # 24 GB — set to ~75% of your machine's RAM
 ```
 
-**On the SSM cold node (Mac Air)** — set `role = "ssm_cold"`:
+**On the SSM cold node (cold machine 2)** — set `role = "ssm_cold"`:
 
 ```toml
 [cluster]
@@ -188,42 +191,112 @@ role = "ssm_cold"
 
 [vault]
 port = 50051
+max_bytes = 12_000_000_000   # 12 GB — set to ~75% of your machine's RAM
 ```
+
+> **`max_bytes`** controls LRU eviction — the vault drops oldest blocks when it reaches this limit. Set it to ~75% of available RAM to leave headroom for the OS. If omitted or set to 0, the vault grows without bound until it OOMs.
 
 `tierkv.toml` is gitignored — it contains your private IPs. Only `tierkv.toml.example` is committed.
 
 ### Step 2 — Start vault servers on cold nodes
 
-On **Mac Pro** and **Mac Air** (not on DGX):
+On each **cold node** (not on the inference node):
 
 ```bash
-tierkv --config /path/to/tierkv.toml vault
+tierkv --config ~/.config/tierkv/tierkv.toml vault
 ```
 
 > **Note:** `--config` is a global flag and must come **before** the subcommand. `tierkv vault --config path` will fail with "unrecognized arguments".
 
-This starts the ColdVault gRPC server that the inference node will send KV data to. Keep it running as a background service (macOS launchd / Linux systemd).
-
-To flush all cached blocks (useful when debugging or switching models):
+Confirm it's listening before moving on:
 
 ```bash
-tierkv --config /path/to/tierkv.toml flush
-tierkv --config /path/to/tierkv.toml flush --target kv_cold   # Mac Pro only
-tierkv --config /path/to/tierkv.toml flush --target ssm_cold  # Mac Air only
+nc -zv localhost 50051 && echo "vault OK"
+# Connection to localhost port 50051 [tcp/*] succeeded!
+# vault OK
+```
+
+> **Firewall:** Port 50051 must be reachable from the inference node. On macOS you'll get a firewall dialog on first launch — click Allow. On Linux: `sudo ufw allow 50051/tcp`
+
+#### Keep it running — macOS launchd
+
+Create `~/Library/LaunchAgents/com.tierkv.vault.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>             <string>com.tierkv.vault</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/tierkv</string>
+        <string>--config</string>
+        <string>/Users/YOUR_USERNAME/.config/tierkv/tierkv.toml</string>
+        <string>vault</string>
+    </array>
+    <key>RunAtLoad</key>         <true/>
+    <key>KeepAlive</key>         <true/>
+    <key>StandardOutPath</key>   <string>/tmp/tierkv-vault.log</string>
+    <key>StandardErrorPath</key> <string>/tmp/tierkv-vault.log</string>
+</dict>
+</plist>
+```
+
+```bash
+# Replace YOUR_USERNAME and adjust the tierkv path (which tierkv)
+launchctl load ~/Library/LaunchAgents/com.tierkv.vault.plist
+launchctl start com.tierkv.vault
+```
+
+#### Keep it running — Linux systemd
+
+```bash
+sudo tee /etc/systemd/system/tierkv-vault.service << 'EOF'
+[Unit]
+Description=tierkv cold vault
+After=network.target
+
+[Service]
+User=YOUR_USERNAME
+ExecStart=/usr/local/bin/tierkv --config /home/YOUR_USERNAME/.config/tierkv/tierkv.toml vault
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now tierkv-vault
+sudo systemctl status tierkv-vault
+```
+
+#### Flush cached blocks
+
+Useful when switching models or debugging a corrupt restore:
+
+```bash
+tierkv --config ~/.config/tierkv/tierkv.toml flush              # both vaults
+tierkv --config ~/.config/tierkv/tierkv.toml flush --target kv_cold   # cold node 1 only
+tierkv --config ~/.config/tierkv/tierkv.toml flush --target ssm_cold  # cold node 2 only
 ```
 
 ### Step 3 — Install the EXO hook on the inference node
 
-On **DGX only**:
+> **Skip this step if you are using the vLLM backend** — see [vLLM Integration](#vllm-integration) instead.
+
+On the **inference node only**:
 
 ```bash
-tierkv install --exo-path /path/to/exo/src/exo
+tierkv --config ~/.config/tierkv/tierkv.toml install --exo-path /path/to/exo/src/exo
 ```
 
-That's it. This command:
+This command:
 1. Copies the tierkv hook into EXO's engine directory
 2. Patches EXO's `cache.py` to set the memory eviction threshold
 3. Patches EXO's `builder.py` to auto-load the hook on startup
+4. Copies `tierkv.toml` into EXO's working directory
 
 Restart EXO. The hook reads `tierkv.toml` from the working directory and connects to the cold nodes automatically.
 
@@ -231,8 +304,10 @@ Restart EXO. The hook reads `tierkv.toml` from the working directory and connect
 
 From the **inference node**, check all nodes are reachable:
 
+> **Note:** Run `tierkv status` from the **inference node** (the one with `role = "inference"` in its config). The cold nodes have minimal configs that don't know the cluster addresses, so `tierkv status` run from a cold node will only check localhost.
+
 ```bash
-tierkv status
+tierkv --config ~/.config/tierkv/tierkv.toml status
 ```
 
 ```
@@ -248,7 +323,7 @@ tierkv status
 ### Step 5 — Benchmark
 
 ```bash
-tierkv bench --exo-api http://192.168.50.11:52415
+tierkv --config ~/.config/tierkv/tierkv.toml bench --exo-api http://192.168.50.11:52415
 ```
 
 Expected output:
@@ -266,7 +341,7 @@ Expected output:
   Time saved per request:   6.79s
 ```
 
-A speedup below **1.5×** means the cold tier isn't being hit — check `tierkv status` to confirm the vault servers are running and reachable.
+A speedup below **1.5×** means the cold tier isn't being hit — check `tierkv --config ~/.config/tierkv/tierkv.toml status` to confirm the vault servers are running and reachable.
 
 ---
 
