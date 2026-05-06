@@ -25,7 +25,7 @@ Tested on Qwen3.6-35B-A3B across a DGX GB10 + Mac Pro + Mac Air cluster:
 | 60k tokens (projected) | ~26s | ~1.2s | ~1.0s | ~26× |
 | 128k tokens (projected) | ~70s | ~1.5s | ~2.0s | ~35× |
 
-Cold vault restore beats GPU cache hit — blocks land directly into the KV cache skipping attention recomputation entirely. The speedup grows with context length because prefill scales super-linearly while restore is near-linear (network transfer). Answer quality is bit-for-bit identical across all three paths.
+Cold vault restore beats GPU cache hit — blocks land directly into the KV cache skipping attention recomputation entirely. The speedup grows with context length because prefill scales super-linearly while restore is near-linear (network transfer). With `turbo_quant = false` in the vault config, output is bit-for-bit identical across all three paths. With TurboQuant INT8 (default), generation is perceptually equivalent but not bitwise identical due to quantization rounding.
 
 ---
 
@@ -439,15 +439,17 @@ Measured on **DGX Spark (GB10, aarch64)** with **Qwen3.6-35B-A3B** (35B MoE, 40 
 | 60k tokens (projected) | ~26s | ~1.2s | ~1.0s | ~26× |
 | 128k tokens (projected) | ~70s | ~1.5s | ~2.0s | ~35× |
 
-**Answer quality:** cold restore produces bit-for-bit identical output to full prefill. TurboQuant INT8 is lossy but per-group quantization preserves KV distributions well enough that the model's output is indistinguishable. The `tensor_hash` field in each `BlockRecord` detects any in-flight corruption.
+**Answer quality:** With `turbo_quant = false`, cold restore produces bit-for-bit identical output to full prefill. With TurboQuant INT8 (default), output is perceptually equivalent — the model produces a correct and coherent answer but the exact tokens may differ from a full prefill due to quantization rounding in the restored KV tensors. The `tensor_hash` field in each `BlockRecord` detects any in-flight corruption.
 
 ```
 Cold Prefill TTFT:   10.75s  (30k-token Apple 10-K, no cache)
 GPU Cache Hit TTFT:   1.19s  (9× faster — same document, blocks in GPU)
 Cold Restore TTFT:    0.52s  (20× faster — blocks in vault, skip attention)
-Answer quality:       identical output across all three paths
+Answer quality:       bit-for-bit identical (turbo_quant=false) or perceptually equivalent (INT8 default)
 Vault:                Mac Pro + Mac Air, 5GbE LAN, 1ms RTT
 ```
+
+**HMA block size:** On hybrid models like Qwen3.6-35B-A3B, vLLM's Hybrid Memory Architecture (HMA) overrides `--block-size` to a larger alignment (e.g. 1056 tokens/block). Cold vault restore only triggers for blocks that have a complete prefix hash, so **prompts must exceed the HMA block size** (≥1056 tokens for Qwen3.6-35B-A3B) to be eligible for vault restore. Short test prompts (<1056 tokens) will never produce a block hash and vault restore will appear inactive.
 
 ### Pre-launch smoke test
 
@@ -568,6 +570,8 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for documented failures and fixes, 
 - SSH lockout during model load
 - Wrong platform wheel installed on Linux
 - vLLM `fastsafetensors` build failure on aarch64
+- Linux OOM killer firing during model load (normal; desktop processes may be killed)
+- vLLM EngineCore zombie holding GPU memory after `pkill` (use `kill_vllm_clean.sh`)
 
 ---
 
@@ -578,4 +582,4 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for documented failures and fixes, 
 - Longer contexts or slower GPUs where prefill is the bottleneck
 - Quantization quality validation with `_kv_offsets` fix in place
 - EXO version detection for hook compatibility
-- LRU eviction inside the cold vault (configurable max capacity — currently vaults grow unbounded in RAM)
+- Persistent cold storage (SQLite / memory-mapped file — blocks survive vault restarts)
