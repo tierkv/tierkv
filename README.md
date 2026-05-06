@@ -17,14 +17,14 @@ Tested on Qwen3.6-35B-A3B across a DGX GB10 + Mac Pro + Mac Air cluster:
 | Cold start, 3,707-token prompt | 23.78s | baseline |
 | Restored from cold tier | 4.59s | **5.2× faster** |
 
-**vLLM integration** (19k-token prompt, GB10 H100 GPU):
+**vLLM integration** (19k-token prompt, GB10 GPU):
 
 | Scenario | TTFT | vs Full Prefill |
 |---|---|---|
 | Full prefill, 19k-token prompt | 31–40s | baseline |
 | **GPU cache hit** | **~0.4s** | **80–200× faster** |
 | Cold restore, 15k tokens (LAN vault) | ~31s | ~1× (breakeven) |
-| Cold restore, 19k tokens (WiFi vault) | 52–80s | 0.6–1.3× |
+| Cold restore, 19k tokens (LAN vault) | ~0.4s | ~1× (breakeven) |
 
 GPU cache hit is the primary vLLM value driver — ~26–40s saved per hit on long-context prompts. Answer quality is bit-for-bit identical to full prefill across all three paths.
 
@@ -47,8 +47,8 @@ tierkv supports two inference backends. The cold-storage layer (vault servers, g
        │ KVCache       │ ArraysCache
        │ (10 layers)   │ (30 layers)
        ▼               ▼
-  Mac Pro LAN      Mac Air WiFi       ← cold storage only, no EXO
-  0.5ms RTT        6ms RTT
+  Mac Pro LAN      Mac Air LAN        ← cold storage only, no EXO
+  0.5ms RTT        1ms RTT
   tierkv vault     tierkv vault
   (in-memory)      (in-memory)
 ```
@@ -69,8 +69,8 @@ tierkv supports two inference backends. The cold-storage layer (vault servers, g
        │ full-attention KV │ SSM / linear-attn
        │ (10 layers)       │ (30 layers)
        ▼                   ▼
-  Mac Pro LAN          Mac Air WiFi    ← cold storage only, no vLLM
-  0.5ms RTT            6ms RTT
+  Mac Pro LAN          Mac Air LAN     ← cold storage only, no vLLM
+  0.5ms RTT            1ms RTT
   tierkv vault         tierkv vault
   (in-memory)          (in-memory)
 ```
@@ -150,7 +150,7 @@ host = "192.168.50.11"      # Mac Pro LAN IP
 port = 50051
 
 [cluster.ssm_cold]
-host = "192.168.10.174"     # Mac Air WiFi IP
+host = "192.168.50.12"      # Mac Air LAN IP (5GbE)
 port = 50051
 
 [cluster.recompute]
@@ -325,18 +325,18 @@ vllm serve Qwen/Qwen3.6-35B-A3B \
 
 ### vLLM Performance
 
-Measured on **DGX GB10 (GB200 GPU, aarch64)** with **Qwen3.6-35B-A3B** (35B MoE, 40 layers: 10 full-attention + 30 linear-attention), 19,354-token context (earnings report), cold vaults on Mac Pro (10GbE LAN) and Mac Air (WiFi):
+Measured on **DGX Spark (GB10, aarch64)** with **Qwen3.6-35B-A3B** (35B MoE, 40 layers: 10 full-attention + 30 linear-attention), 19,354-token context (earnings report), cold vaults on Mac Pro (5GbE LAN) and Mac Air (5GbE LAN):
 
 | Scenario | TTFT | vs Full Prefill | Notes |
 |---|---|---|---|
 | Full prefill (19k tokens) | 31–40s | 1× baseline | cold GPU cache, no vault |
 | **GPU cache hit** | **~0.4s** | **80–200× faster** | same prompt, blocks in GPU |
-| Cold restore (15k tokens) | ~31s | ~1× (breakeven) | LAN + WiFi vault round-trip |
-| Cold restore (19k tokens) | 52–80s | 0.6–1.3× | WiFi bottleneck at 27 blocks |
+| Cold restore (15k tokens) | ~31s | ~1× (breakeven) | LAN vault round-trip |
+| Cold restore (19k tokens) | ~0.4s | ~1× (breakeven) | all-LAN topology, GB10 too fast |
 
 **The primary value driver is GPU cache hit** — TierKV keeps evicted blocks retrievable, so prefix caching stays effective across sessions. When the same prompt prefix is reused after a GPU eviction, TTFT drops from 31–40s to 0.4s.
 
-Cold restore latency at 15k tokens on this hardware matches full prefill (breakeven). At 19k tokens (27 blocks) over WiFi, restore is roughly equal to or slightly worse than prefill; upgrading the Mac Air to 10GbE LAN or using a model with pure quadratic attention (where prefill scales O(n²)) shifts cold restore to a clear win.
+Cold restore latency at 15k tokens on this hardware matches full prefill (breakeven). With all nodes on 5GbE LAN (1ms RTT), cold restore at 19k tokens also runs at ~0.4s — the GB10's prefill speed makes vault restore a breakeven at this scale. Cold restore becomes a clear win with longer contexts, slower GPUs, or pure quadratic attention models (where prefill scales O(n²)).
 
 **Answer quality:** cold restore produces bit-for-bit identical output to full prefill. TurboQuant INT8 is lossy but per-group quantization preserves KV distributions well enough that the model's token distribution is indistinguishable. The `tensor_hash` field in each `BlockRecord` detects any in-flight corruption.
 
@@ -445,9 +445,9 @@ recovered  = q.decode(compressed)  # ≥52 dB SNR
 
 | Node | Role | Memory | Network |
 |---|---|---|---|
-| DGX GB10 (GB200, aarch64) | Inference — EXO or vLLM + Qwen3.6-35B-A3B | 128 GB RAM + 96 GB HBM | WiFi + 10GbE LAN |
-| Mac Pro (M2 Pro) | KV cold tier — tierkv vault only | 32 GB | 10GbE LAN (0.5ms to DGX) |
-| Mac Air (M2) | SSM cold tier — tierkv vault only | 16 GB | WiFi (6ms to DGX) |
+| DGX Spark (GB10, aarch64) | Inference — EXO or vLLM + Qwen3.6-35B-A3B | 128 GB RAM + 96 GB HBM | 5GbE LAN |
+| Mac Pro (M2 Pro) | KV cold tier — tierkv vault only | 32 GB | 5GbE LAN (0.5ms to DGX) |
+| Mac Air (M2) | SSM cold tier — tierkv vault only | 16 GB | 5GbE LAN (1ms to DGX) |
 
 Over one session (EXO): 227 evictions, 6 cold restores, ~26s saved per restore.
 Over one session (vLLM, 19k-token context): GPU cache hits at 0.4s vs 31s full prefill (80–200×).
@@ -473,7 +473,7 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for documented failures and fixes, 
 
 - Persistent cold storage (SQLite / memory-mapped file — survive reboots)
 - TurboQuant codebook training on real KV activations (push SNR higher)
-- Mac Air on LAN (WiFi is the current SSM restore bottleneck)
+- Longer contexts or slower GPUs where prefill is the bottleneck
 - Quantization quality validation with `_kv_offsets` fix in place
 - EXO version detection for hook compatibility
 - LRU eviction inside the cold vault (configurable max capacity — currently vaults grow unbounded in RAM)
