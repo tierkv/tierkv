@@ -111,13 +111,16 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         )
         if self.cfg.registry_db_path and engine_id not in TierKVConnector._shared_registries:
             from tierkv.connectors.vllm.registry_persistence import PersistentBlockRegistry
-            _is_worker = (
-                KVConnectorRole is not None
-                and role == KVConnectorRole.WORKER
-            )
+            # Both SCHEDULER and WORKER connectors run in the same EngineCore process
+            # and share one registry object via _shared_registries. Always create
+            # read-write so mark_stored enqueues SQLite writes regardless of which
+            # role initializes first.
             TierKVConnector._shared_registries[engine_id] = PersistentBlockRegistry(
                 self.cfg.registry_db_path,
-                readonly=_is_worker,
+            )
+            _log.info(
+                "[tierkv] PersistentBlockRegistry created: path=%s role=%s",
+                self.cfg.registry_db_path, role,
             )
         self.registry = TierKVConnector._shared_registries.setdefault(
             engine_id, BlockRegistry()
@@ -307,6 +310,11 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             return False, None
 
+        _log.info(
+            "[tierkv] request_finished: %d block hashes, %d tokens",
+            len(block_hashes), getattr(request, "num_tokens", 0),
+        )
+
         if not self.request_handler.should_store(block_hashes):
             return False, None
 
@@ -444,6 +452,7 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
         # Fall back to forward_context for older vLLM versions.
         kv_caches = getattr(self, "_kv_caches", None) or getattr(forward_context, "kv_caches", None)
         if kv_caches is None:
+            _log.warning("[tierkv] _worker_execute_store: kv_caches is None — all blocks marked failed!")
             for block_hash_hex, _group_ids, _layer_type, _num_tokens in block_specs:
                 self.registry.mark_failed(bytes.fromhex(block_hash_hex))
             return
@@ -501,8 +510,10 @@ class TierKVConnector(KVConnectorBase_V1, SupportsHMA):
                         .to(dtype=torch.float32).cpu().numpy().tobytes()
                     )
                 else:
+                    _log.warning("[tierkv] _worker_execute_store: no tensors for block %s pid=%d sid=%d", block_hash_hex[:16], primary_id, secondary_id)
                     self.registry.mark_failed(block_hash)
-            except Exception:
+            except Exception as _exc:
+                _log.warning("[tierkv] _worker_execute_store: exception for block %s: %s", block_hash_hex[:16], _exc)
                 self.registry.mark_failed(block_hash)
 
         # Reconstruct BlockRecord objects on the worker side.

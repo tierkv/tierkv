@@ -28,6 +28,7 @@ Usage
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import queue
@@ -115,6 +116,7 @@ class PersistentBlockRegistry(BlockRegistry):
                 daemon=True,
             )
             self._writer.start()
+            atexit.register(self.close)
 
         self._load_from_db(max_age_seconds)
         _log.info(
@@ -206,8 +208,14 @@ class PersistentBlockRegistry(BlockRegistry):
         conn = self._connect()
         try:
             while True:
-                # Block until at least one item arrives
-                item = self._queue.get()
+                # Wait up to 2 seconds for an item so we commit promptly
+                # even if close() is never called (e.g. os._exit).
+                try:
+                    item = self._queue.get(timeout=2.0)
+                except queue.Empty:
+                    # Nothing pending — loop back and wait again.
+                    continue
+
                 if item is _STOP:
                     break
 
@@ -251,6 +259,10 @@ class PersistentBlockRegistry(BlockRegistry):
                         conn.executemany(_DELETE, deletes)
                     if upserts or deletes:
                         conn.commit()
+                        _log.info(
+                            "[tierkv] registry: committed %d upserts %d deletes to SQLite",
+                            len(upserts), len(deletes),
+                        )
                 except sqlite3.Error as exc:
                     _log.error("[tierkv] db write error: %s", exc)
                     try:

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import hashlib
+import logging
 import time
 from typing import Optional
+
+_log = logging.getLogger(__name__)
 
 from tierkv.connectors.vault_client import VllmVaultClient
 from tierkv.connectors.vllm.block_registry import BlockRegistry, BlockRecord
@@ -126,17 +129,30 @@ class RequestHandler:
         tensor_map: dict[bytes, bytes],
         free_fn,
     ) -> None:
+        ok = fail = skip = 0
         try:
             for record in pending_records:
                 tensor_bytes = tensor_map.get(record.block_hash)
                 if tensor_bytes is None:
                     self.registry.mark_failed(record.block_hash)
+                    skip += 1
                     continue
                 try:
                     self._store_one(record, tensor_bytes)
-                except Exception:
+                    ok += 1
+                except Exception as exc:
+                    _log.warning(
+                        "[tierkv] _store_one FAILED block=%s layer=%s nbytes=%d: %s",
+                        record.block_hash.hex()[:16], record.layer_type,
+                        len(tensor_bytes), exc,
+                    )
                     self.registry.mark_failed(record.block_hash)
+                    fail += 1
         finally:
+            if fail or skip:
+                _log.warning("[tierkv] _store_all done: ok=%d fail=%d skip=%d", ok, fail, skip)
+            else:
+                _log.info("[tierkv] _store_all done: ok=%d", ok)
             free_fn()
 
     def _store_one(self, record: BlockRecord, tensor_bytes: bytes) -> None:

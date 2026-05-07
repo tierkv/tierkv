@@ -69,3 +69,9 @@ port = 50051
 # across vLLM restarts. Without this, vault blocks become unreachable on restart.
 # Uncomment and set to a stable path (directory must exist):
 # registry_db_path = "/home/user/.local/share/tierkv/registry.db"
+#
+# IMPORTANT: also set PYTHONHASHSEED to a fixed value when launching vLLM, e.g.:
+#   export PYTHONHASHSEED=42
+# Without this, vLLM randomizes its block hash seed on every restart, so stored
+# block hashes never match new requests and vault restore silently falls back to
+# cold prefill. This only matters when registry_db_path is set.
